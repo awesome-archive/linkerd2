@@ -29,9 +29,9 @@ func TestMain(m *testing.M) {
 func TestRoutes(t *testing.T) {
 	// control-plane routes
 	cmd := []string{"routes", "--namespace", TestHelper.GetLinkerdNamespace(), "deploy"}
-	out, _, err := TestHelper.LinkerdRun(cmd...)
+	out, stderr, err := TestHelper.LinkerdRun(cmd...)
 	if err != nil {
-		t.Fatalf("Routes command failed\n%s", out)
+		t.Fatalf("Routes command failed\n%s\n%s", out, stderr)
 	}
 
 	routeStrings := []struct {
@@ -39,15 +39,18 @@ func TestRoutes(t *testing.T) {
 		c int
 	}{
 		{"linkerd-controller-api", 9},
-		{"linkerd-destination", 3},
+		{"linkerd-destination", 1},
+		{"linkerd-dst", 3},
 		{"linkerd-grafana", 12},
 		{"linkerd-identity", 2},
 		{"linkerd-prometheus", 5},
 		{"linkerd-web", 2},
+		{"linkerd-tap", 3},
 
 		{"POST /api/v1/ListPods", 1},
 		{"POST /api/v1/", 8},
 		{"POST /io.linkerd.proxy.destination.Destination/Get", 2},
+		{"POST /linkerd2.controller.tap.Tap/TapByResource", 1},
 		{"GET /api/annotations", 1},
 		{"GET /api/", 9},
 		{"GET /public/", 3},
@@ -66,9 +69,9 @@ func TestRoutes(t *testing.T) {
 	cmd = []string{"routes", "--namespace", prefixedNs, "deploy"}
 	golden := "routes.smoke.golden"
 
-	out, _, err = TestHelper.LinkerdRun(cmd...)
+	out, stderr, err = TestHelper.LinkerdRun(cmd...)
 	if err != nil {
-		t.Fatalf("Routes command failed\n%s", out)
+		t.Fatalf("Routes command failed\n%s\n%s", out, stderr)
 	}
 
 	err = TestHelper.ValidateOutput(out, golden)

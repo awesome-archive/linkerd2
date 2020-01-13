@@ -1,7 +1,7 @@
 /* global require, module, __dirname */
 
 const path = require('path');
-const CleanWebpackPlugin = require('clean-webpack-plugin');
+const { CleanWebpackPlugin } = require('clean-webpack-plugin');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const LodashModuleReplacementPlugin = require('lodash-webpack-plugin');
 const WebpackMvPlugin = require('./webpack-mv-plugin.js');
@@ -48,7 +48,7 @@ module.exports = {
         test: /\.css$/,
         use: [
           'style-loader',
-          { loader: 'css-loader', options: { importLoaders: 1, minimize: true } },
+          { loader: 'css-loader', options: { importLoaders: 1 } },
         ]
       },
       {
@@ -66,11 +66,14 @@ module.exports = {
   },
   plugins: [
     // new BundleAnalyzerPlugin(), // uncomment to analyze bundle size
-    new CleanWebpackPlugin(['dist']),
+    new CleanWebpackPlugin({
+      protectWebpackAssets: false
+    }),
     new LodashModuleReplacementPlugin({
       // 'chain': true,
       'collections': true,
-      'paths': true
+      'paths': true,
+      'shorthands': true
     }),
     // compile the bundle with hashed filename into index_bundle.js.out
     new HtmlWebpackPlugin({

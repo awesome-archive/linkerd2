@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha1"
+	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	api "github.com/linkerd/linkerd2/controller/k8s"
 	"github.com/linkerd/linkerd2/pkg/k8s"
@@ -148,7 +148,7 @@ func (s *grpcServer) topRoutesFor(ctx context.Context, req *pb.TopRoutesRequest,
 			}
 
 			for _, svc := range services {
-				p := s.k8sAPI.GetServiceProfileFor(svc, clientNs)
+				p := s.k8sAPI.GetServiceProfileFor(svc, clientNs, s.clusterDomain)
 				profiles[svc.GetName()] = p
 			}
 		}

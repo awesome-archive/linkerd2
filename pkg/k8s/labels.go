@@ -7,6 +7,7 @@ package k8s
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/linkerd/linkerd2/pkg/version"
 	appsv1 "k8s.io/api/apps/v1"
@@ -20,6 +21,10 @@ const (
 
 	// Prefix is the prefix common to all labels and annotations injected by Linkerd
 	Prefix = "linkerd.io"
+
+	// LinkerdNamespaceLabel is a label that helps identifying the namespaces
+	// that contain a Linkerd control plane
+	LinkerdNamespaceLabel = Prefix + "/is-control-plane"
 
 	// ControllerComponentLabel identifies this object as a component of Linkerd's
 	// control plane (e.g. web, controller).
@@ -52,6 +57,10 @@ const (
 	// ProxyStatefulSetLabel is injected into mesh-enabled apps, identifying the
 	// StatefulSet that this proxy belongs to.
 	ProxyStatefulSetLabel = Prefix + "/proxy-statefulset"
+
+	// ProxyCronJobLabel is injected into mesh-enabled apps, identifying the
+	// CronJob that this proxy belongs to.
+	ProxyCronJobLabel = Prefix + "/proxy-cronjob"
 
 	/*
 	 * Annotations
@@ -93,6 +102,9 @@ const (
 	// ProxyConfigAnnotationsPrefix is the prefix of all config-related annotations
 	ProxyConfigAnnotationsPrefix = "config.linkerd.io"
 
+	// ProxyConfigAnnotationsPrefixAlpha is the prefix of newly released config-related annotations
+	ProxyConfigAnnotationsPrefixAlpha = "config.alpha.linkerd.io"
+
 	// ProxyImageAnnotation can be used to override the proxyImage config.
 	ProxyImageAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-image"
 
@@ -103,6 +115,9 @@ const (
 	// ProxyInitImageAnnotation can be used to override the proxyInitImage
 	// config.
 	ProxyInitImageAnnotation = ProxyConfigAnnotationsPrefix + "/init-image"
+
+	// ProxyInitImageVersionAnnotation can be used to overrided the proxy-init image version
+	ProxyInitImageVersionAnnotation = ProxyConfigAnnotationsPrefix + "/init-image-version"
 
 	// ProxyControlPortAnnotation can be used to override the controlPort config.
 	ProxyControlPortAnnotation = ProxyConfigAnnotationsPrefix + "/control-port"
@@ -154,6 +169,28 @@ const (
 	// ProxyDisableIdentityAnnotation can be used to disable identity on the injected proxy.
 	ProxyDisableIdentityAnnotation = ProxyConfigAnnotationsPrefix + "/disable-identity"
 
+	// ProxyDisableTapAnnotation can be used to disable tap on the injected proxy.
+	ProxyDisableTapAnnotation = ProxyConfigAnnotationsPrefix + "/disable-tap"
+
+	// ProxyEnableDebugAnnotation is set to true if the debug container is
+	// injected.
+	ProxyEnableDebugAnnotation = ProxyConfigAnnotationsPrefix + "/enable-debug-sidecar"
+
+	// ProxyTraceCollectorSvcAddrAnnotation can be used to enable tracing on a proxy.
+	// It takes the collector service name (e.g. oc-collector.tracing:55678) as
+	// its value.
+	ProxyTraceCollectorSvcAddrAnnotation = ProxyConfigAnnotationsPrefix + "/trace-collector"
+
+	// ProxyWaitBeforeExitSecondsAnnotation makes the proxy container to wait for the given period before exiting
+	// after the Pod entered the Terminating state. Must be smaller than terminationGracePeriodSeconds
+	// configured for the Pod
+	ProxyWaitBeforeExitSecondsAnnotation = ProxyConfigAnnotationsPrefixAlpha + "/proxy-wait-before-exit-seconds"
+
+	// ProxyTraceCollectorSvcAccountAnnotation is used to specify the service account
+	// associated with the trace collector. It is used to create the service's
+	// mTLS identity.
+	ProxyTraceCollectorSvcAccountAnnotation = ProxyConfigAnnotationsPrefixAlpha + "/trace-collector-service-account"
+
 	// IdentityModeDefault is assigned to IdentityModeAnnotation to
 	// use the control plane's default identity scheme.
 	IdentityModeDefault = "default"
@@ -188,11 +225,17 @@ const (
 	// IdentityIssuerSecretName is the name of the Secret that stores issuer credentials.
 	IdentityIssuerSecretName = "linkerd-identity-issuer"
 
+	// IdentityIssuerSchemeLinkerd is the issuer secret scheme used by linkerd
+	IdentityIssuerSchemeLinkerd = "linkerd.io/tls"
+
 	// IdentityIssuerKeyName is the issuer's private key file.
 	IdentityIssuerKeyName = "key.pem"
 
 	// IdentityIssuerCrtName is the issuer's certificate file.
 	IdentityIssuerCrtName = "crt.pem"
+
+	// IdentityIssuerTrustAnchorsNameExternal is the issuer's certificate file (when using cert-manager).
+	IdentityIssuerTrustAnchorsNameExternal = "ca.crt"
 
 	// ProxyPortName is the name of the Linkerd Proxy's proxy port.
 	ProxyPortName = "linkerd-proxy"
@@ -211,6 +254,12 @@ const (
 
 	// SPValidatorWebhookConfigName is the name of the validating webhook configuration
 	SPValidatorWebhookConfigName = SPValidatorWebhookServiceName + "-webhook-config"
+
+	// TapServiceName is the name of the tap APIService
+	TapServiceName = "linkerd-tap"
+
+	// AdmissionWebhookLabel indicates whether admission webhooks are enabled for a namespace
+	AdmissionWebhookLabel = ProxyConfigAnnotationsPrefix + "/admission-webhooks"
 
 	/*
 	 * Mount paths
@@ -235,6 +284,12 @@ const (
 	// MountPathEndEntity is the path at which a tmpfs directory is mounted to
 	// store identity credentials.
 	MountPathEndEntity = MountPathBase + "/identity/end-entity"
+
+	// MountPathTLSKeyPEM is the path at which the TLS key PEM file is mounted.
+	MountPathTLSKeyPEM = MountPathBase + "/tls/key.pem"
+
+	// MountPathTLSCrtPEM is the path at which the TLS cert PEM file is mounted.
+	MountPathTLSCrtPEM = MountPathBase + "/tls/crt.pem"
 
 	// IdentityServiceAccountTokenPath is the path to the kubernetes service
 	// account token used by proxies to provision identity.
@@ -287,4 +342,16 @@ func GetPodLabels(ownerKind, ownerName string, pod *corev1.Pod) map[string]strin
 // IsMeshed returns whether a given Pod is in a given controller's service mesh.
 func IsMeshed(pod *corev1.Pod, controllerNS string) bool {
 	return pod.Labels[ControllerNSLabel] == controllerNS
+}
+
+// IsTapDisabled returns true if the pod has an annotation for explicitly
+// disabling tap
+func IsTapDisabled(pod *corev1.Pod) bool {
+	if valStr := pod.Annotations[ProxyDisableTapAnnotation]; valStr != "" {
+		valBool, err := strconv.ParseBool(valStr)
+		if err == nil && valBool {
+			return true
+		}
+	}
+	return false
 }

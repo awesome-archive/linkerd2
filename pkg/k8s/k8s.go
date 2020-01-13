@@ -2,8 +2,6 @@ package k8s
 
 import (
 	"fmt"
-	"net/url"
-	"strings"
 
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -13,6 +11,7 @@ import (
 const (
 	All                   = "all"
 	Authority             = "authority"
+	CronJob               = "cronjob"
 	DaemonSet             = "daemonset"
 	Deployment            = "deployment"
 	Job                   = "job"
@@ -23,8 +22,10 @@ const (
 	Service               = "service"
 	ServiceProfile        = "serviceprofile"
 	StatefulSet           = "statefulset"
+	TrafficSplit          = "trafficsplit"
+	Node                  = "node"
 
-	ServiceProfileAPIVersion = "linkerd.io/v1alpha1"
+	ServiceProfileAPIVersion = "linkerd.io/v1alpha2"
 	ServiceProfileKind       = "ServiceProfile"
 
 	// special case k8s job label, to not conflict with Prometheus' job label
@@ -34,6 +35,7 @@ const (
 // AllResources is a sorted list of all resources defined as constants above.
 var AllResources = []string{
 	Authority,
+	CronJob,
 	DaemonSet,
 	Deployment,
 	Job,
@@ -44,6 +46,7 @@ var AllResources = []string{
 	Service,
 	ServiceProfile,
 	StatefulSet,
+	TrafficSplit,
 }
 
 // StatAllResourceTypes represents the resources to query in StatSummary when Resource.Type is "all"
@@ -56,24 +59,10 @@ var StatAllResourceTypes = []string{
 	ReplicationController,
 	Pod,
 	Service,
+	TrafficSplit,
 	Authority,
-}
-
-func generateKubernetesAPIURLFor(serverURL, namespace, path string) (*url.URL, error) {
-	if !strings.HasPrefix(path, "/") {
-		return nil, fmt.Errorf("path must start with a /, got [%s]", path)
-	}
-
-	fullPath := "/api/v1/namespaces/" + namespace + path
-	return generateKubernetesURL(serverURL, fullPath)
-}
-
-func generateKubernetesURL(serverURL, path string) (*url.URL, error) {
-	if !strings.HasPrefix(path, "/") {
-		return nil, fmt.Errorf("path must start with a /, got [%s]", path)
-	}
-
-	return url.Parse(strings.TrimSuffix(serverURL, "/") + path)
+	CronJob,
+	ReplicaSet,
 }
 
 // GetConfig returns kubernetes config based on the current environment.
@@ -98,6 +87,8 @@ func CanonicalResourceNameFromFriendlyName(friendlyName string) (string, error) 
 	switch friendlyName {
 	case "au", "authority", "authorities":
 		return Authority, nil
+	case "cj", "cronjob", "cronjobs":
+		return CronJob, nil
 	case "ds", "daemonset", "daemonsets":
 		return DaemonSet, nil
 	case "deploy", "deployment", "deployments":
@@ -118,6 +109,8 @@ func CanonicalResourceNameFromFriendlyName(friendlyName string) (string, error) 
 		return ServiceProfile, nil
 	case "sts", "statefulset", "statefulsets":
 		return StatefulSet, nil
+	case "ts", "trafficsplit", "trafficsplits":
+		return TrafficSplit, nil
 	case "all":
 		return All, nil
 	}
@@ -131,6 +124,8 @@ func ShortNameFromCanonicalResourceName(canonicalName string) string {
 	switch canonicalName {
 	case Authority:
 		return "au"
+	case CronJob:
+		return "cj"
 	case DaemonSet:
 		return "ds"
 	case Deployment:
@@ -151,6 +146,8 @@ func ShortNameFromCanonicalResourceName(canonicalName string) string {
 		return "sp"
 	case StatefulSet:
 		return "sts"
+	case TrafficSplit:
+		return "ts"
 	default:
 		return ""
 	}

@@ -17,17 +17,14 @@ of this repo, unless otherwise indicated by a `cd` command.
   - [Prerequisites](#prerequisites)
   - [Running tests](#running-tests)
   - [Writing tests](#writing-tests)
-- [Integration tests: proxy-init](#integration-tests-proxy-init)
 
 # Unit tests
 
 ## Go
 
-Go dependencies are managed via [dep](https://github.com/golang/dep). To fetch
-dependencies and run tests, run:
+To run tests:
 
 ```bash
-bin/dep ensure
 go test -cover -race ./...
 ```
 
@@ -98,7 +95,6 @@ cluster. Prior to running the test suite, verify that:
 - The `kubectl` CLI has been configured to talk to that Kubernetes cluster
 - The namespace where the tests will install Linkerd does not already exist;
   by default the namespace `l5d-integration` is used
-- The repo's Go dependencies have been downloaded by running `bin/dep ensure`
 
 ## Running tests
 
@@ -151,7 +147,7 @@ specialtest-get-test      Active    1m
 To cleanup the namespaces after the test has finished, run:
 
 ```bash
-$ bin/test-cleanup specialtest
+$ bin/test-cleanup
 ```
 
 ### Testing against a locally-built version of the CLI
@@ -297,27 +293,6 @@ your own tests, view the `testutil` package's godoc, with:
 $ godoc github.com/linkerd/linkerd2/testutil | less
 ```
 
-# Integration tests: proxy-init
-
-The `proxy-init/` directory contains a separate set of integration tests, which
-can be run in your Kubernetes cluster. The instructions below assume that you
-are using [minikube](https://github.com/kubernetes/minikube).
-
-Start by building and tagging the `proxy-init` image required for the test:
-
-```bash
-DOCKER_TRACE=1 bin/mkube bin/docker-build-proxy-init
-bin/mkube docker tag gcr.io/linkerd-io/proxy-init:`bin/root-tag` gcr.io/linkerd-io/proxy-init:latest
-```
-
-The run the tests with:
-
-```bash
-cd proxy-init/integration_test
-eval $(minikube docker-env)
-./run_tests.sh
-```
-
 # Scale tests
 
 The scale tests deploy a single Linkerd control-plane, and then scale up
@@ -344,7 +319,7 @@ bin/test-scale `pwd`/bin/linkerd
 ## Cleanup
 
 ```bash
-bin/test-cleanup l5d-scale
+bin/test-cleanup
 ```
 
 # Test against multiple cloud providers

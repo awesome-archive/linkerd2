@@ -8,14 +8,37 @@ kubernetes-version
 √ is running the minimum Kubernetes API version
 √ is running the minimum kubectl version
 
+linkerd-config
+--------------
+√ control plane Namespace exists
+√ control plane ClusterRoles exist
+√ control plane ClusterRoleBindings exist
+√ control plane ServiceAccounts exist
+√ control plane CustomResourceDefinitions exist
+√ control plane MutatingWebhookConfigurations exist
+√ control plane ValidatingWebhookConfigurations exist
+√ control plane PodSecurityPolicies exist
+
 linkerd-existence
 -----------------
-√ control plane namespace exists
-√ control plane components ready
+√ 'linkerd-config' config map exists
+√ heartbeat ServiceAccount exist
+√ control plane replica sets are ready
 √ no unschedulable pods
 √ controller pod is running
 √ can initialize the client
 √ can query the control plane API
+
+linkerd-identity
+----------------
+√ certificate config is valid
+√ trust roots are using supported crypto algorithm
+√ trust roots are within their validity period
+√ trust roots are valid for at least 60 days
+√ issuer cert is using supported crypto algorithm
+√ issuer cert is within its validity period
+√ issuer cert is valid for at least 60 days
+√ issuer cert is issued by the trust root
 
 linkerd-api
 -----------
@@ -23,7 +46,6 @@ linkerd-api
 √ control plane self-check
 √ [kubernetes] control plane can talk to Kubernetes
 √ [prometheus] control plane can talk to Prometheus
-√ no invalid service profiles
 
 linkerd-version
 ---------------

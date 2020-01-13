@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"time"
 
 	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/prometheus/common/model"
 	log "github.com/sirupsen/logrus"
+	"go.opencensus.io/trace"
 )
 
 type promType string
@@ -44,11 +47,18 @@ func extractSampleValue(sample *model.Sample) uint64 {
 func (s *grpcServer) queryProm(ctx context.Context, query string) (model.Vector, error) {
 	log.Debugf("Query request:\n\t%+v", query)
 
+	_, span := trace.StartSpan(ctx, "query.prometheus")
+	defer span.End()
+	span.AddAttributes(trace.StringAttribute("queryString", query))
+
 	// single data point (aka summary) query
-	res, err := s.prometheusAPI.Query(ctx, query, time.Time{})
+	res, warn, err := s.prometheusAPI.Query(ctx, query, time.Time{})
 	if err != nil {
 		log.Errorf("Query(%+v) failed with: %+v", query, err)
 		return nil, err
+	}
+	if warn != nil {
+		log.Warnf("%v", warn)
 	}
 	log.Debugf("Query response:\n\t%+v", res)
 
@@ -114,6 +124,33 @@ func promDstQueryLabels(resource *pb.Resource) model.LabelSet {
 	}
 
 	return set
+}
+
+// insert a not-nil check into a LabelSet to verify that data for a specified
+// label name exists. due to the `!=` this must be inserted as a string. the
+// structure of this code is taken from the Prometheus labelset.go library.
+func generateLabelStringWithExclusion(l model.LabelSet, labelName string) string {
+	lstrs := make([]string, 0, len(l))
+	for l, v := range l {
+		lstrs = append(lstrs, fmt.Sprintf("%s=%q", l, v))
+	}
+	lstrs = append(lstrs, fmt.Sprintf(`%s!=""`, labelName))
+
+	sort.Strings(lstrs)
+	return fmt.Sprintf("{%s}", strings.Join(lstrs, ", "))
+}
+
+// insert a regex-match check into a LabelSet for labels that match the provided
+// string. this is modeled on generateLabelStringWithExclusion().
+func generateLabelStringWithRegex(l model.LabelSet, labelName string, stringToMatch string) string {
+	lstrs := make([]string, 0, len(l))
+	for l, v := range l {
+		lstrs = append(lstrs, fmt.Sprintf("%s=%q", l, v))
+	}
+	lstrs = append(lstrs, fmt.Sprintf(`%s=~"^%s.+"`, labelName, stringToMatch))
+
+	sort.Strings(lstrs)
+	return fmt.Sprintf("{%s}", strings.Join(lstrs, ", "))
 }
 
 // determine if we should add "namespace=<namespace>" to a named query

@@ -28,23 +28,23 @@ import (
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/cni/pkg/version"
+	"github.com/linkerd/linkerd2-proxy-init/cmd"
+	"github.com/linkerd/linkerd2-proxy-init/iptables"
 	"github.com/linkerd/linkerd2/pkg/k8s"
-	"github.com/linkerd/linkerd2/proxy-init/cmd"
-	"github.com/linkerd/linkerd2/proxy-init/iptables"
-	"github.com/projectcalico/libcalico-go/lib/logutils"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ProxyInit is the configuration for the proxy-init binary
 type ProxyInit struct {
-	IncomingProxyPort     int   `json:"incoming-proxy-port"`
-	OutgoingProxyPort     int   `json:"outgoing-proxy-port"`
-	ProxyUID              int   `json:"proxy-uid"`
-	PortsToRedirect       []int `json:"ports-to-redirect"`
-	InboundPortsToIgnore  []int `json:"inbound-ports-to-ignore"`
-	OutboundPortsToIgnore []int `json:"outbound-ports-to-ignore"`
-	Simulate              bool  `json:"simulate"`
+	IncomingProxyPort     int      `json:"incoming-proxy-port"`
+	OutgoingProxyPort     int      `json:"outgoing-proxy-port"`
+	ProxyUID              int      `json:"proxy-uid"`
+	PortsToRedirect       []int    `json:"ports-to-redirect"`
+	InboundPortsToIgnore  []string `json:"inbound-ports-to-ignore"`
+	OutboundPortsToIgnore []string `json:"outbound-ports-to-ignore"`
+	Simulate              bool     `json:"simulate"`
+	UseWaitFlag           bool     `json:"use-wait-flag"`
 }
 
 // Kubernetes a K8s specific struct to hold config
@@ -76,10 +76,6 @@ type PluginConf struct {
 }
 
 func main() {
-	// Set up logging formatting.
-	logrus.SetFormatter(&logutils.Formatter{})
-	// Install a hook that adds file/line no information.
-	logrus.AddHook(&logutils.ContextHook{})
 	skel.PluginMain(cmdAdd, cmdDel, version.All)
 }
 
@@ -164,7 +160,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	})
 
 	if namespace != "" && podName != "" {
-		client, err := k8s.NewAPI(conf.Kubernetes.Kubeconfig, "linkerd-cni-context", 0)
+		client, err := k8s.NewAPI(conf.Kubernetes.Kubeconfig, "linkerd-cni-context", "", 0)
 		if err != nil {
 			return err
 		}
@@ -191,7 +187,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 
 		if containsLinkerdProxy && !containsInitContainer {
-			logEntry.Infof("linkerd-cni: setting up iptables firewall")
+			logEntry.Debug("linkerd-cni: setting up iptables firewall")
 			options := cmd.RootOptions{
 				IncomingProxyPort:     conf.ProxyInit.IncomingProxyPort,
 				OutgoingProxyPort:     conf.ProxyInit.OutgoingProxyPort,
@@ -201,6 +197,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 				OutboundPortsToIgnore: conf.ProxyInit.OutboundPortsToIgnore,
 				SimulateOnly:          conf.ProxyInit.Simulate,
 				NetNs:                 args.Netns,
+				UseWaitFlag:           conf.ProxyInit.UseWaitFlag,
 			}
 			firewallConfiguration, err := cmd.BuildFirewallConfiguration(&options)
 			if err != nil {
@@ -210,27 +207,27 @@ func cmdAdd(args *skel.CmdArgs) error {
 			iptables.ConfigureFirewall(*firewallConfiguration)
 		} else {
 			if containsInitContainer {
-				logEntry.Infof("linkerd-cni: linkerd-init initContainer is present, skipping.")
+				logEntry.Debug("linkerd-cni: linkerd-init initContainer is present, skipping.")
 			} else {
-				logEntry.Infof("linkerd-cni: linkerd-proxy is not present, skipping.")
+				logEntry.Debug("linkerd-cni: linkerd-proxy is not present, skipping.")
 			}
 		}
 	} else {
-		logEntry.Infof("linkerd-cni: no Kubernetes namespace or pod name found, skipping.")
+		logEntry.Debug("linkerd-cni: no Kubernetes namespace or pod name found, skipping.")
 	}
 
-	logrus.Infof("linkerd-cni: plugin is finished")
+	logrus.Debug("linkerd-cni: plugin is finished")
 	if conf.PrevResult != nil {
 		// Pass through the prevResult for the next plugin
 		return types.PrintResult(conf.PrevResult, conf.CNIVersion)
 	}
 
-	logrus.Infof("linkerd-cni: no previous result to pass through, emptying stdout")
+	logrus.Debug("linkerd-cni: no previous result to pass through, emptying stdout")
 	return nil
 }
 
 // cmdDel is called for DELETE requests
 func cmdDel(args *skel.CmdArgs) error {
-	logrus.Info("linkerd-cni: cmdDel not implemented")
+	logrus.Debug("linkerd-cni: cmdDel not implemented")
 	return nil
 }

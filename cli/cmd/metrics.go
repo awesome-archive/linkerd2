@@ -37,7 +37,7 @@ func (s byResult) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 func (s byResult) Less(i, j int) bool {
-	return s[i].pod < s[i].pod
+	return s[i].pod < s[j].pod
 }
 
 func newMetricsOptions() *metricsOptions {
@@ -62,6 +62,7 @@ func newCmdMetrics() *cobra.Command {
   (TYPE/NAME)
 
   Examples:
+  * cronjob/my-cronjob
   * deploy/my-deploy
   * ds/my-daemonset
   * job/my-job
@@ -70,6 +71,7 @@ func newCmdMetrics() *cobra.Command {
   * sts/my-statefulset
 
   Valid resource types include:
+  * cronjobs
   * daemonsets
   * deployments
   * jobs
@@ -91,7 +93,7 @@ func newCmdMetrics() *cobra.Command {
   )`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, 0)
+			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, 0)
 			if err != nil {
 				return err
 			}
@@ -161,16 +163,9 @@ func getMetrics(
 	}
 
 	defer portforward.Stop()
-
-	go func() {
-		err := portforward.Run()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error running port-forward: %s", err)
-			portforward.Stop()
-		}
-	}()
-
-	<-portforward.Ready()
+	if err = portforward.Init(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error running port-forward: %s", err)
+	}
 
 	metricsURL := portforward.URLFor("/metrics")
 	resp, err := http.Get(metricsURL)
@@ -214,6 +209,23 @@ func getPodsFor(clientset kubernetes.Interface, namespace string, resource strin
 
 	var matchLabels map[string]string
 	switch res.GetType() {
+	case k8s.CronJob:
+		jobs, err := clientset.BatchV1().Jobs(namespace).List(metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		var pods []corev1.Pod
+		for _, job := range jobs.Items {
+			if isOwner(res.GetName(), job.GetOwnerReferences()) {
+				jobPods, err := getPodsFor(clientset, namespace, fmt.Sprintf("%s/%s", k8s.Job, job.GetName()))
+				if err != nil {
+					return nil, err
+				}
+				pods = append(pods, jobPods...)
+			}
+		}
+		return pods, nil
+
 	case k8s.DaemonSet:
 		ds, err := clientset.AppsV1().DaemonSets(namespace).Get(res.GetName(), metav1.GetOptions{})
 		if err != nil {
@@ -273,4 +285,13 @@ func getPodsFor(clientset kubernetes.Interface, namespace string, resource strin
 	}
 
 	return podList.Items, nil
+}
+
+func isOwner(resourceName string, ownerRefs []metav1.OwnerReference) bool {
+	for _, or := range ownerRefs {
+		if resourceName == or.Name {
+			return true
+		}
+	}
+	return false
 }

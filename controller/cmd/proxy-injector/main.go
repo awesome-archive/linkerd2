@@ -1,23 +1,19 @@
-package main
+package proxyinjector
 
 import (
 	"github.com/linkerd/linkerd2/controller/k8s"
 	injector "github.com/linkerd/linkerd2/controller/proxy-injector"
-	"github.com/linkerd/linkerd2/controller/proxy-injector/tmpl"
 	"github.com/linkerd/linkerd2/controller/webhook"
-	pkgK8s "github.com/linkerd/linkerd2/pkg/k8s"
 )
 
-func main() {
-	config := &webhook.Config{
-		TemplateStr: tmpl.MutatingWebhookConfigurationSpec,
-		Ops:         &injector.Ops{},
-	}
+// Main executes the proxy-injector subcommand
+func Main(args []string) {
 	webhook.Launch(
-		config,
-		[]k8s.APIResource{k8s.NS, k8s.RS},
+		[]k8s.APIResource{k8s.NS, k8s.Deploy, k8s.RC, k8s.RS, k8s.Job, k8s.DS, k8s.SS, k8s.Pod, k8s.CJ},
 		9995,
-		pkgK8s.ProxyInjectorWebhookServiceName,
 		injector.Inject,
+		"linkerd-proxy-injector",
+		"proxy-injector",
+		args,
 	)
 }

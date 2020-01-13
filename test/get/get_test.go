@@ -34,11 +34,13 @@ var (
 
 	linkerdPods = map[string]int{
 		"linkerd-controller":     1,
+		"linkerd-destination":    1,
 		"linkerd-grafana":        1,
 		"linkerd-identity":       1,
 		"linkerd-prometheus":     1,
 		"linkerd-proxy-injector": 1,
 		"linkerd-sp-validator":   1,
+		"linkerd-tap":            1,
 		"linkerd-web":            1,
 	}
 )
@@ -48,12 +50,16 @@ var (
 //////////////////////
 
 func TestCliGet(t *testing.T) {
-	out, _, err := TestHelper.LinkerdRun("inject", "testdata/to_be_injected_application.yaml")
+	out, stderr, err := TestHelper.LinkerdRun("inject", "testdata/to_be_injected_application.yaml")
 	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
+		t.Fatalf("Unexpected error: %v\n%s", err, stderr)
 	}
 
 	prefixedNs := TestHelper.GetTestNamespace("get-test")
+	err = TestHelper.CreateDataPlaneNamespaceIfNotExists(prefixedNs, nil)
+	if err != nil {
+		t.Fatalf("failed to create %s namespace: %s", prefixedNs, err)
+	}
 	out, err = TestHelper.KubectlApply(out, prefixedNs)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v output:\n%s", err, out)
@@ -77,33 +83,31 @@ func TestCliGet(t *testing.T) {
 	}
 
 	t.Run("get pods from --all-namespaces", func(t *testing.T) {
-		out, _, err = TestHelper.LinkerdRun("get", "pods", "--all-namespaces")
-
+		out, stderr, err = TestHelper.LinkerdRun("get", "pods", "--all-namespaces")
 		if err != nil {
-			t.Fatalf("Unexpected error: %v output:\n%s", err, out)
+			t.Fatalf("Unexpected error: %v output:\n%s\n%s", err, out, stderr)
 		}
 
-		err := checkPodOutput(out, deployReplicas, prefixedNs)
+		err := checkPodOutput(out, deployReplicas, "", prefixedNs)
 		if err != nil {
 			t.Fatalf("Pod output check failed:\n%s\nCommand output:\n%s", err, out)
 		}
 	})
 
 	t.Run("get pods from the linkerd namespace", func(t *testing.T) {
-		out, _, err = TestHelper.LinkerdRun("get", "pods", "-n", TestHelper.GetLinkerdNamespace())
-
+		out, stderr, err = TestHelper.LinkerdRun("get", "pods", "-n", TestHelper.GetLinkerdNamespace())
 		if err != nil {
-			t.Fatalf("Unexpected error: %v output:\n%s", err, out)
+			t.Fatalf("Unexpected error: %v output:\n%s\n%s", err, out, stderr)
 		}
 
-		err := checkPodOutput(out, linkerdPods, TestHelper.GetLinkerdNamespace())
+		err := checkPodOutput(out, linkerdPods, "linkerd-heartbeat", TestHelper.GetLinkerdNamespace())
 		if err != nil {
 			t.Fatalf("Pod output check failed:\n%s\nCommand output:\n%s", err, out)
 		}
 	})
 }
 
-func checkPodOutput(cmdOutput string, expectedPodCounts map[string]int, namespace string) error {
+func checkPodOutput(cmdOutput string, expectedPodCounts map[string]int, optionalPod string, namespace string) error {
 	expectedPods := []string{}
 	for podName, replicas := range expectedPodCounts {
 		for i := 0; i < replicas; i++ {
@@ -141,7 +145,15 @@ func checkPodOutput(cmdOutput string, expectedPodCounts map[string]int, namespac
 	sort.Strings(expectedPods)
 	sort.Strings(actualPods)
 	if !reflect.DeepEqual(expectedPods, actualPods) {
-		return fmt.Errorf("Expected linkerd get to return:\n%v\nBut got:\n%v", expectedPods, actualPods)
+		if optionalPod == "" {
+			return fmt.Errorf("Expected linkerd get to return:\n%v\nBut got:\n%v", expectedPods, actualPods)
+		}
+
+		expectedPlusOptionalPods := append(expectedPods, optionalPod)
+		sort.Strings(expectedPlusOptionalPods)
+		if !reflect.DeepEqual(expectedPlusOptionalPods, actualPods) {
+			return fmt.Errorf("Expected linkerd get to return:\n%v\nor:\n%v\nBut got:\n%v", expectedPods, expectedPlusOptionalPods, actualPods)
+		}
 	}
 
 	return nil

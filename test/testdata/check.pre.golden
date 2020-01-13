@@ -11,18 +11,20 @@ kubernetes-version
 pre-kubernetes-setup
 --------------------
 √ control plane namespace does not already exist
-√ can create Namespaces
-√ can create ClusterRoles
-√ can create ClusterRoleBindings
-√ can create CustomResourceDefinitions
+√ can create non-namespaced resources
 √ can create ServiceAccounts
 √ can create Services
 √ can create Deployments
+√ can create CronJobs
 √ can create ConfigMaps
+√ can create Secrets
+√ can read Secrets
+√ no clock skew detected
 
 pre-kubernetes-capability
 -------------------------
 √ has NET_ADMIN capability
+√ has NET_RAW capability
 
 linkerd-version
 ---------------

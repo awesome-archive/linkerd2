@@ -9,7 +9,9 @@ import (
 	"github.com/julienschmidt/httprouter"
 	"github.com/linkerd/linkerd2/controller/api/public"
 	pb "github.com/linkerd/linkerd2/controller/gen/public"
+	"github.com/linkerd/linkerd2/pkg/k8s"
 	profiles "github.com/linkerd/linkerd2/pkg/profiles"
+	"github.com/patrickmn/go-cache"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -21,9 +23,13 @@ type (
 	handler struct {
 		render              renderTemplate
 		apiClient           public.APIClient
+		k8sAPI              *k8s.KubernetesAPI
 		uuid                string
 		controllerNamespace string
+		clusterDomain       string
 		grafanaProxy        *grafanaProxy
+		hc                  healthChecker
+		statCache           *cache.Cache
 	}
 )
 
@@ -68,7 +74,7 @@ func (h *handler) handleProfileDownload(w http.ResponseWriter, req *http.Request
 	}
 
 	profileYaml := &bytes.Buffer{}
-	err := profiles.RenderProfileTemplate(namespace, service, profileYaml)
+	err := profiles.RenderProfileTemplate(namespace, service, h.clusterDomain, profileYaml)
 
 	if err != nil {
 		log.Error(err)

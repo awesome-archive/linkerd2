@@ -1,6 +1,7 @@
 package util
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -20,7 +21,8 @@ import (
 */
 
 var (
-	defaultMetricTimeWindow = "1m"
+	defaultMetricTimeWindow    = "1m"
+	metricTimeWindowLowerBound = time.Second * 15 //the window value needs to equal or larger than that
 
 	// ValidTargets specifies resource types allowed as a target:
 	// target resource on an inbound query
@@ -28,11 +30,13 @@ var (
 	// destination resource on an outbound 'from' query
 	ValidTargets = []string{
 		k8s.Authority,
+		k8s.CronJob,
 		k8s.DaemonSet,
 		k8s.Deployment,
 		k8s.Job,
 		k8s.Namespace,
 		k8s.Pod,
+		k8s.ReplicaSet,
 		k8s.ReplicationController,
 		k8s.StatefulSet,
 	}
@@ -40,11 +44,13 @@ var (
 	// ValidTapDestinations specifies resource types allowed as a tap destination:
 	// destination resource on an outbound 'to' query
 	ValidTapDestinations = []string{
+		k8s.CronJob,
 		k8s.DaemonSet,
 		k8s.Deployment,
 		k8s.Job,
 		k8s.Namespace,
 		k8s.Pod,
+		k8s.ReplicaSet,
 		k8s.ReplicationController,
 		k8s.Service,
 		k8s.StatefulSet,
@@ -75,6 +81,14 @@ type StatsSummaryRequestParams struct {
 	TCPStats      bool
 }
 
+// EdgesRequestParams contains parameters that are used to build
+// Edges requests.
+type EdgesRequestParams struct {
+	Namespace     string
+	ResourceType  string
+	AllNamespaces bool
+}
+
 // TopRoutesRequestParams contains parameters that are used to build TopRoutes
 // requests.
 type TopRoutesRequestParams struct {
@@ -96,6 +110,7 @@ type TapRequestParams struct {
 	Method      string
 	Authority   string
 	Path        string
+	Extract     bool
 }
 
 // GRPCError generates a gRPC error code, as defined in
@@ -135,10 +150,15 @@ func GRPCError(err error) error {
 func BuildStatSummaryRequest(p StatsSummaryRequestParams) (*pb.StatSummaryRequest, error) {
 	window := defaultMetricTimeWindow
 	if p.TimeWindow != "" {
-		_, err := time.ParseDuration(p.TimeWindow)
+		w, err := time.ParseDuration(p.TimeWindow)
 		if err != nil {
 			return nil, err
 		}
+
+		if w < metricTimeWindowLowerBound {
+			return nil, errors.New("metrics time window needs to be at least 15s")
+		}
+
 		window = p.TimeWindow
 	}
 
@@ -218,6 +238,30 @@ func BuildStatSummaryRequest(p StatsSummaryRequestParams) (*pb.StatSummaryReques
 	}
 
 	return statRequest, nil
+}
+
+// BuildEdgesRequest builds a Public API EdgesRequest from a
+// EdgesRequestParams.
+func BuildEdgesRequest(p EdgesRequestParams) (*pb.EdgesRequest, error) {
+	namespace := p.Namespace
+	if namespace == "" && !p.AllNamespaces {
+		namespace = corev1.NamespaceDefault
+	}
+	resourceType, err := k8s.CanonicalResourceNameFromFriendlyName(p.ResourceType)
+	if err != nil {
+		return nil, err
+	}
+
+	edgesRequest := &pb.EdgesRequest{
+		Selector: &pb.ResourceSelection{
+			Resource: &pb.Resource{
+				Namespace: namespace,
+				Type:      resourceType,
+			},
+		},
+	}
+
+	return edgesRequest, nil
 }
 
 // BuildTopRoutesRequest builds a Public API TopRoutesRequest from a
@@ -456,6 +500,15 @@ func BuildTapByResourceRequest(params TapRequestParams) (*pb.TapByResourceReques
 		matches = append(matches, &match)
 	}
 
+	extract := &pb.TapByResourceRequest_Extract{}
+	if params.Extract {
+		extract = buildExtractHTTP(&pb.TapByResourceRequest_Extract_Http{
+			Extract: &pb.TapByResourceRequest_Extract_Http_Headers_{
+				Headers: &pb.TapByResourceRequest_Extract_Http_Headers{},
+			},
+		})
+	}
+
 	return &pb.TapByResourceRequest{
 		Target: &pb.ResourceSelection{
 			Resource: &target,
@@ -468,6 +521,7 @@ func BuildTapByResourceRequest(params TapRequestParams) (*pb.TapByResourceReques
 				},
 			},
 		},
+		Extract: extract,
 	}, nil
 }
 
@@ -475,6 +529,14 @@ func buildMatchHTTP(match *pb.TapByResourceRequest_Match_Http) pb.TapByResourceR
 	return pb.TapByResourceRequest_Match{
 		Match: &pb.TapByResourceRequest_Match_Http_{
 			Http: match,
+		},
+	}
+}
+
+func buildExtractHTTP(extract *pb.TapByResourceRequest_Extract_Http) *pb.TapByResourceRequest_Extract {
+	return &pb.TapByResourceRequest_Extract{
+		Extract: &pb.TapByResourceRequest_Extract_Http_{
+			Http: extract,
 		},
 	}
 }
@@ -501,8 +563,12 @@ func CreateTapEvent(eventHTTP *pb.TapEvent_Http, dstMeta map[string]string, prox
 		},
 		Destination: &pb.TcpAddress{
 			Ip: &pb.IPAddress{
-				Ip: &pb.IPAddress_Ipv4{
-					Ipv4: uint32(9),
+				Ip: &pb.IPAddress_Ipv6{
+					Ipv6: &pb.IPv6{
+						// All nodes address: https://www.iana.org/assignments/ipv6-multicast-addresses/ipv6-multicast-addresses.xhtml
+						First: binary.BigEndian.Uint64([]byte{0xff, 0x01, 0, 0, 0, 0, 0, 0}),
+						Last:  binary.BigEndian.Uint64([]byte{0, 0, 0, 0, 0, 0, 0, 0x01}),
+					},
 				},
 			},
 		},

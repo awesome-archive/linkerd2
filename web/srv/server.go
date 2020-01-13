@@ -1,22 +1,35 @@
 package srv
 
 import (
+	"fmt"
+	"html"
 	"html/template"
 	"net/http"
 	"path"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/julienschmidt/httprouter"
 	"github.com/linkerd/linkerd2/controller/api/public"
 	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/filesonly"
+	"github.com/linkerd/linkerd2/pkg/healthcheck"
+	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/prometheus"
+	"github.com/patrickmn/go-cache"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
 	timeout = 10 * time.Second
+
+	// statExpiration indicates when items in the stat cache expire.
+	statExpiration = 1500 * time.Millisecond
+
+	// statCleanupInterval indicates how often expired items in the stat cache
+	// are cleaned up.
+	statCleanupInterval = 5 * time.Minute
 )
 
 type (
@@ -26,6 +39,7 @@ type (
 		reload      bool
 		templates   map[string]*template.Template
 		router      *httprouter.Router
+		reHost      *regexp.Regexp
 	}
 
 	templatePayload struct {
@@ -39,10 +53,27 @@ type (
 		ErrorMessage        string
 		PathPrefix          string
 	}
+
+	healthChecker interface {
+		RunChecks(observer healthcheck.CheckObserver) bool
+	}
 )
 
 // this is called by the HTTP server to actually respond to a request
 func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if !s.reHost.MatchString(req.Host) {
+		error := fmt.Sprintf(`It appears that you are trying to reach this service with a host of '%s'.
+This does not match /%s/ and has been denied for security reasons.
+Please see https://linkerd.io/dns-rebinding for an explanation of what is happening and how to fix it.`,
+			html.EscapeString(req.Host),
+			html.EscapeString(s.reHost.String()))
+
+		http.Error(w, error, http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+	w.Header().Set("X-XSS-Protection", "1; mode=block")
 	s.router.ServeHTTP(w, req)
 }
 
@@ -56,12 +87,17 @@ func NewServer(
 	staticDir string,
 	uuid string,
 	controllerNamespace string,
+	clusterDomain string,
 	reload bool,
+	reHost *regexp.Regexp,
 	apiClient public.APIClient,
+	k8sAPI *k8s.KubernetesAPI,
+	hc healthChecker,
 ) *http.Server {
 	server := &Server{
 		templateDir: templateDir,
 		reload:      reload,
+		reHost:      reHost,
 	}
 
 	server.router = &httprouter.Router{
@@ -73,10 +109,14 @@ func NewServer(
 	wrappedServer := prometheus.WithTelemetry(server)
 	handler := &handler{
 		apiClient:           apiClient,
+		k8sAPI:              k8sAPI,
 		render:              server.RenderTemplate,
 		uuid:                uuid,
 		controllerNamespace: controllerNamespace,
+		clusterDomain:       clusterDomain,
 		grafanaProxy:        newGrafanaProxy(grafanaAddr),
+		hc:                  hc,
+		statCache:           cache.New(statExpiration, statCleanupInterval),
 	}
 
 	httpServer := &http.Server{
@@ -88,27 +128,46 @@ func NewServer(
 
 	// webapp routes
 	server.router.GET("/", handler.handleIndex)
-	server.router.GET("/overview", handler.handleIndex)
-	server.router.GET("/servicemesh", handler.handleIndex)
+	server.router.GET("/controlplane", handler.handleIndex)
 	server.router.GET("/namespaces", handler.handleIndex)
-	server.router.GET("/namespaces/:namespace", handler.handleIndex)
+
+	// paths for a list of resources by namespace
+	server.router.GET("/namespaces/:namespace/daemonsets", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/statefulsets", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/trafficsplits", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/jobs", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/deployments", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/replicationcontrollers", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/pods", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/cronjobs", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/replicasets", handler.handleIndex)
+
+	// legacy paths that are deprecated but should not 404
+	server.router.GET("/overview", handler.handleIndex)
 	server.router.GET("/daemonsets", handler.handleIndex)
 	server.router.GET("/statefulsets", handler.handleIndex)
+	server.router.GET("/trafficsplits", handler.handleIndex)
 	server.router.GET("/jobs", handler.handleIndex)
 	server.router.GET("/deployments", handler.handleIndex)
 	server.router.GET("/replicationcontrollers", handler.handleIndex)
 	server.router.GET("/pods", handler.handleIndex)
-	server.router.GET("/authorities", handler.handleIndex)
+
+	// paths for individual resource view
+	server.router.GET("/namespaces/:namespace", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/pods/:pod", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/daemonsets/:daemonset", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/statefulsets/:statefulset", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/trafficsplits/:trafficsplit", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/deployments/:deployment", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/jobs/:job", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/replicationcontrollers/:replicationcontroller", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/cronjobs/:cronjob", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/replicasets/:replicaset", handler.handleIndex)
+
+	// tools and community paths
 	server.router.GET("/tap", handler.handleIndex)
 	server.router.GET("/top", handler.handleIndex)
 	server.router.GET("/community", handler.handleIndex)
-	server.router.GET("/debug", handler.handleIndex)
 	server.router.GET("/routes", handler.handleIndex)
 	server.router.GET("/profiles/new", handler.handleProfileDownload)
 
@@ -125,7 +184,9 @@ func NewServer(
 	server.router.GET("/api/services", handler.handleAPIServices)
 	server.router.GET("/api/tap", handler.handleAPITap)
 	server.router.GET("/api/routes", handler.handleAPITopRoutes)
-	server.router.GET("/api/endpoints", handler.handleAPIEndpoints)
+	server.router.GET("/api/edges", handler.handleAPIEdges)
+	server.router.GET("/api/check", handler.handleAPICheck)
+	server.router.GET("/api/resource-definition", handler.handleAPIResourceDefinition)
 
 	// grafana proxy
 	server.router.DELETE("/grafana/*grafanapath", handler.handleGrafana)
@@ -191,7 +252,7 @@ func mkStaticHandler(staticDir string) httprouter.Handle {
 		filepath := p.ByName("filepath")
 		if filepath == "/index_bundle.js" {
 			// don't cache the bundle because it references a hashed js file
-			w.Header().Set("Cache-Control", "no-cache, private, max-age=0")
+			w.Header().Set("Cache-Control", "no-store, must-revalidate")
 		}
 
 		req.URL.Path = filepath

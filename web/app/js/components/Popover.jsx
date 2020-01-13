@@ -5,14 +5,17 @@ import { withStyles } from '@material-ui/core/styles';
 
 const styles = theme => ({
   paper: {
-    padding: theme.spacing.unit,
+    padding: theme.spacing(1),
   },
 });
 
 class ClickablePopover extends React.Component {
-  state = {
-    anchorEl: null,
-  };
+  constructor(props) {
+    super(props);
+    this.state = {
+      anchorEl: null,
+    };
+  }
 
   handleClick = event => {
     this.setState({ anchorEl: event.currentTarget });
@@ -62,8 +65,7 @@ class ClickablePopover extends React.Component {
 
 ClickablePopover.propTypes = {
   baseContent: PropTypes.node.isRequired,
-  classes: PropTypes.shape({}).isRequired,
-  popoverContent: PropTypes.node.isRequired
+  popoverContent: PropTypes.node.isRequired,
 };
 
 export default withStyles(styles)(ClickablePopover);

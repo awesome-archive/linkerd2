@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"net/http"
 
@@ -12,33 +11,52 @@ import (
 	pkgTls "github.com/linkerd/linkerd2/pkg/tls"
 	log "github.com/sirupsen/logrus"
 	admissionv1beta1 "k8s.io/api/admission/v1beta1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/yaml"
 )
 
-type handlerFunc func(*k8s.API, *admissionv1beta1.AdmissionRequest) (*admissionv1beta1.AdmissionResponse, error)
+type handlerFunc func(*k8s.API, *admissionv1beta1.AdmissionRequest, record.EventRecorder) (*admissionv1beta1.AdmissionResponse, error)
 
 // Server describes the https server implementing the webhook
 type Server struct {
 	*http.Server
-	api                 *k8s.API
-	handler             handlerFunc
-	controllerNamespace string
+	api      *k8s.API
+	handler  handlerFunc
+	recorder record.EventRecorder
 }
 
 // NewServer returns a new instance of Server
-func NewServer(api *k8s.API, addr, name, controllerNamespace string, rootCA *pkgTls.CA, handler handlerFunc) (*Server, error) {
-	c, err := tlsConfig(rootCA, name, controllerNamespace)
+func NewServer(api *k8s.API, addr string, cred *pkgTls.Cred, handler handlerFunc, component string) (*Server, error) {
+	var (
+		certPEM = cred.EncodePEM()
+		keyPEM  = cred.EncodePrivateKeyPEM()
+	)
+
+	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	if err != nil {
 		return nil, err
 	}
 
 	server := &http.Server{
-		Addr:      addr,
-		TLSConfig: c,
+		Addr: addr,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		},
 	}
 
-	s := &Server{server, api, handler, controllerNamespace}
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
+		// In order to send events to all namespaces, we need to use an empty string here
+		// re: client-go's event_expansion.go CreateWithEventNamespace()
+		Interface: api.Client.CoreV1().Events(""),
+	})
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: component})
+
+	s := &Server{server, api, handler, recorder}
 	s.Handler = http.HandlerFunc(s.serve)
 	return s, nil
 }
@@ -101,7 +119,7 @@ func (s *Server) processReq(data []byte) *admissionv1beta1.AdmissionReview {
 	log.Infof("received admission review request %s", admissionReview.Request.UID)
 	log.Debugf("admission request: %+v", admissionReview.Request)
 
-	admissionResponse, err := s.handler(s.api, admissionReview.Request)
+	admissionResponse, err := s.handler(s.api, admissionReview.Request, s.recorder)
 	if err != nil {
 		log.Error("failed to inject sidecar. Reason: ", err)
 		admissionReview.Response = &admissionv1beta1.AdmissionResponse{
@@ -121,29 +139,6 @@ func (s *Server) processReq(data []byte) *admissionv1beta1.AdmissionReview {
 // Shutdown initiates a graceful shutdown of the underlying HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	return s.Server.Shutdown(ctx)
-}
-
-func tlsConfig(rootCA *pkgTls.CA, name, controllerNamespace string) (*tls.Config, error) {
-	// must use the service short name in this TLS identity as the k8s api server
-	// looks for the webhook at <svc_name>.<namespace>.svc, without the cluster
-	// domain.
-	dnsName := fmt.Sprintf("%s.%s.svc", name, controllerNamespace)
-
-	cred, err := rootCA.GenerateEndEntityCred(dnsName)
-	if err != nil {
-		return nil, err
-	}
-
-	certPEM := cred.EncodePEM()
-	keyPEM := cred.EncodePrivateKeyPEM()
-	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
-	if err != nil {
-		return nil, err
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}, nil
 }
 
 func decode(data []byte) (*admissionv1beta1.AdmissionReview, error) {

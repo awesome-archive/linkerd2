@@ -3,6 +3,7 @@ import Dialog from '@material-ui/core/Dialog';
 import DialogActions from '@material-ui/core/DialogActions';
 import DialogContent from '@material-ui/core/DialogContent';
 import DialogTitle from '@material-ui/core/DialogTitle';
+import EmptyCard from './EmptyCard.jsx';
 import ExpandMoreIcon from '@material-ui/icons/ExpandMore';
 import IconButton from '@material-ui/core/IconButton';
 import Paper from '@material-ui/core/Paper';
@@ -18,14 +19,26 @@ import { withStyles } from '@material-ui/core/styles';
 const styles = theme => ({
   root: {
     width: '100%',
-    marginTop: theme.spacing.unit * 3,
+    marginTop: theme.spacing(3),
     overflowX: 'auto',
   },
   expandedWrap: {
-    wordBreak: `break-word`
+    wordBreak: 'break-word',
+    paddingTop: '10px',
   },
   table: {
-    minWidth: 700
+    minWidth: 700,
+  },
+  tableHeader: {
+    fontSize: '12px',
+    opacity: 0.6,
+    lineHeight: 1,
+  },
+  denseTable: {
+    paddingRight: '8px',
+    '&:last-child': {
+      paddingRight: '24px',
+    },
   },
 });
 
@@ -35,7 +48,7 @@ class ExpandableTable extends React.Component {
 
     this.state = {
       open: false,
-      datum: {}
+      datum: {},
     };
   }
 
@@ -48,69 +61,79 @@ class ExpandableTable extends React.Component {
   };
 
   render() {
+    const { datum, open } = this.state;
     const { expandedRowRender, classes, tableRows, tableColumns, tableClassName } = this.props;
-    let columns = [{
-      title: " ",
-      key: "expansion",
+    const columns = [{
+      title: ' ',
+      key: 'expansion',
       render: d => {
         return (
           <IconButton onClick={this.handleDialogOpen(d)}><ExpandMoreIcon /></IconButton>
         );
-      }
+      },
     }].concat(tableColumns);
 
     return (
-      <Paper className={classes.root}>
+      <Paper className={classes.root} elevation={3}>
         <Table
-          className={`${classes.table} ${tableClassName}`}
-          padding="dense">
+          className={`${classes.table} ${tableClassName}`}>
           <TableHead>
             <TableRow>
               {
                 columns.map(c => (
                   <TableCell
                     key={c.key}
-                    numeric={c.isNumeric}>{c.title}
+                    className={`${classes.tableHeader} ${classes.denseTable}`}
+                    align={c.isNumeric ? 'right' : 'left'}>{c.title}
                   </TableCell>
-                  )
-                )
+                ))
               }
             </TableRow>
           </TableHead>
           <TableBody>
-            { tableRows.map(d => {
-                return (
-                  <React.Fragment key={"frag-" + d.key}>
-                    <TableRow
-                      key={d.key}
-                      onClick={this.handleClick}
-                      ref={ref => {
-                        this.container = ref;
-                      }}>
-                      {
-                        columns.map(c => (
-                          <TableCell
-                            key={`table-${d.key}-${c.key}`}
-                            numeric={c.isNumeric}>
-                            {c.render(d)}
-                          </TableCell>
-                        ))
-                      }
-                    </TableRow>
-                  </React.Fragment>
-                );
-              }
+            { tableRows.length > 0 && (
+              <React.Fragment>
+                { tableRows.map(d => {
+                  return (
+                    <React.Fragment key={`frag-${d.key}`}>
+                      <TableRow
+                        key={d.key}
+                        onClick={this.handleClick}
+                        ref={ref => {
+                          this.container = ref;
+                        }}>
+                        {
+                            columns.map(c => (
+                              <TableCell
+                                key={`table-${d.key}-${c.key}`}
+                                className={classes.denseTable}
+                                align={c.isNumeric ? 'right' : 'left'}>
+                                {c.render(d)}
+                              </TableCell>
+                            ))
+                          }
+                      </TableRow>
+                    </React.Fragment>
+                  );
+                })}
+              </React.Fragment>
             )}
           </TableBody>
         </Table>
+
+        { tableRows.length === 0 && (
+          <EmptyCard />
+        )}
+
         <Dialog
           maxWidth="md"
-          open={this.state.open}
+          fullWidth
+          open={open}
           onClose={this.handleDialogClose}
           aria-labelledby="form-dialog-title">
           <DialogTitle id="form-dialog-title">Request Details</DialogTitle>
           <DialogContent>
-            {expandedRowRender(this.state.datum, classes.expandedWrap)}
+            {expandedRowRender(datum, classes.expandedWrap)}
           </DialogContent>
           <DialogActions>
             <Button onClick={this.handleDialogClose} color="primary">Close</Button>
@@ -122,20 +145,19 @@ class ExpandableTable extends React.Component {
 }
 
 ExpandableTable.propTypes = {
-  classes: PropTypes.shape({}).isRequired,
   expandedRowRender: PropTypes.func.isRequired,
   tableClassName: PropTypes.string,
   tableColumns: PropTypes.arrayOf(PropTypes.shape({
     title: PropTypes.string,
     isNumeric: PropTypes.bool,
-    render: PropTypes.func
+    render: PropTypes.func,
   })).isRequired,
-  tableRows: PropTypes.arrayOf(PropTypes.shape({}))
+  tableRows: PropTypes.arrayOf(PropTypes.shape({})),
 };
 
 ExpandableTable.defaultProps = {
-  tableClassName: "",
-  tableRows: []
+  tableClassName: '',
+  tableRows: [],
 };
 
 export default withStyles(styles)(ExpandableTable);

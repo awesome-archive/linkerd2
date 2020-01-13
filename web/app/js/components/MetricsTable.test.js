@@ -7,6 +7,7 @@ import { mount } from 'enzyme';
 describe('Tests for <MetricsTable>', () => {
   const defaultProps = {
     api: ApiHelpers(''),
+    selectedNamespace: "default",
   };
 
   it('renders the table with all columns', () => {
@@ -25,7 +26,7 @@ describe('Tests for <MetricsTable>', () => {
 
     expect(table).toBeDefined();
     expect(table.props().tableRows).toHaveLength(1);
-    expect(table.props().tableColumns).toHaveLength(9);
+    expect(table.props().tableColumns).toHaveLength(8);
   });
 
   it('if enableFilter is true, user can filter rows by search term', () => {
@@ -50,19 +51,13 @@ describe('Tests for <MetricsTable>', () => {
 
     const enableFilter = table.prop('enableFilter');
 
-    const filterIcon = table.find("FilterListIcon");
-
     expect(enableFilter).toEqual(true);
-    expect(filterIcon).toBeDefined();
     expect(table.html()).toContain('books');
     expect(table.html()).toContain('authors');
-    filterIcon.simulate("click");
-    setTimeout(() => {
-      const input = table.find("input");
-      input.simulate("change", {target: {value: "authors"}});
-      expect(table.html()).not.toContain('books');
-      expect(table.html()).toContain('authors');
-      }, 100);
+    table.instance().setState({ showFilter: true, filterBy: /authors/ });
+    component.update();
+    expect(table.html()).not.toContain('books');
+    expect(table.html()).toContain('authors');
   });
 
   it('omits the namespace column for the namespace resource', () => {
@@ -89,13 +84,13 @@ describe('Tests for <MetricsTable>', () => {
     expect(table.props().tableColumns).toHaveLength(8);
   });
 
-  it('omits meshed column for an authority resource', () => {
-    let extraProps = _merge({}, defaultProps, { metrics: [], resource: "authority"});
+  it('adds apex, leaf and weight columns, and omits meshed and grafana column, for a trafficsplit resource', () => {
+    let extraProps = _merge({}, defaultProps, { metrics: [], resource: "trafficsplit"});
     const component = mount(routerWrap(MetricsTable, extraProps));
 
     const table = component.find("BaseTable");
 
     expect(table).toBeDefined();
-    expect(table.props().tableColumns).toHaveLength(8);
+    expect(table.props().tableColumns).toHaveLength(9);
   });
 });

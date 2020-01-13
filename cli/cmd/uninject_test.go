@@ -24,6 +24,12 @@ func TestUninjectYAML(t *testing.T) {
 			reportFileName: "inject_emojivoto_deployment_uninject.report",
 		},
 		{
+			// remove all the linkerd.io/* annotations
+			inputFileName:  "inject_emojivoto_deployment_overridden_noinject.golden.yml",
+			goldenFileName: "inject_emojivoto_deployment_uninjected.input.yml",
+			reportFileName: "inject_emojivoto_deployment_uninject.report",
+		},
+		{
 			inputFileName:  "inject_emojivoto_list.golden.yml",
 			goldenFileName: "inject_emojivoto_list.input.yml",
 			reportFileName: "inject_emojivoto_list_uninject.report",
@@ -77,6 +83,16 @@ func TestUninjectYAML(t *testing.T) {
 			inputFileName:  "inject_emojivoto_deployment_config_overrides.golden.yml",
 			goldenFileName: "inject_emojivoto_deployment_config_overrides.input.yml",
 			reportFileName: "inject_emojivoto_deployment_uninject.report",
+		},
+		{
+			inputFileName:  "inject_emojivoto_namespace_good.golden.yml",
+			goldenFileName: "inject_emojivoto_namespace_uninjected_good.golden.yml",
+			reportFileName: "inject_emojivoto_namespace_uninjected_good.golden.report",
+		},
+		{
+			inputFileName:  "inject_emojivoto_namespace_overidden_good.golden.yml",
+			goldenFileName: "inject_emojivoto_namespace_uninjected_good.golden.yml",
+			reportFileName: "inject_emojivoto_namespace_uninjected_good.golden.report",
 		},
 	}
 

@@ -35,6 +35,10 @@ type (
 		// For now we do not attempt to meet CABForum requirements (e.g. regarding
 		// randomness).
 		nextSerialNumber uint64
+
+		// firstCrtExpiration is the time when the first expiration of a certificate
+		// in the trust chain occurs
+		firstCrtExpiration time.Time
 	}
 
 	// Validity configures the expiry times of issued certificates.
@@ -52,6 +56,10 @@ type (
 		// processes the certificates must have a system clock that is off by no
 		// more than this allowance in either direction.
 		ClockSkewAllowance time.Duration
+
+		// ValidFrom is the point in time from which the certificate is valid.
+		// This is cert.NotBefore with some clock skew allowance.
+		ValidFrom *time.Time
 	}
 
 	// Issuer implementors signs certificate requests.
@@ -79,9 +87,21 @@ const (
 	DefaultClockSkewAllowance = 10 * time.Second
 )
 
+// Finds the time at which the first certificate
+// from the chain will expire
+func findFirstExpiration(cred *Cred) time.Time {
+	firstExpiration := cred.Certificate.NotAfter
+	for _, c := range cred.TrustChain {
+		if c.NotAfter.Before(firstExpiration) {
+			firstExpiration = c.NotAfter
+		}
+	}
+	return firstExpiration
+}
+
 // NewCA initializes a new CA with default settings.
 func NewCA(cred Cred, validity Validity) *CA {
-	return &CA{cred, validity, uint64(1)}
+	return &CA{cred, validity, uint64(1), findFirstExpiration(&cred)}
 }
 
 func init() {
@@ -138,7 +158,7 @@ func GenerateRootCAWithDefaults(name string) (*CA, error) {
 }
 
 // GenerateCA generates a new intermdiary CA.
-func (ca *CA) GenerateCA(name string, validity Validity, maxPathLen int) (*CA, error) {
+func (ca *CA) GenerateCA(name string, maxPathLen int) (*CA, error) {
 	key, err := GenerateKey()
 	if err != nil {
 		return nil, err
@@ -208,6 +228,14 @@ func (ca *CA) IssueEndEntityCrt(csr *x509.CertificateRequest) (Crt, error) {
 func (ca *CA) createTemplate(pubkey *ecdsa.PublicKey) *x509.Certificate {
 	c := createTemplate(ca.nextSerialNumber, pubkey, ca.Validity)
 	ca.nextSerialNumber++
+	// if our trust chain contains a certificate that expires
+	// sooner than the one we intend to issue, we clamp the
+	// NotAfter time of our newly issued certificate. That ensures
+	// the proxy will request a new cert before any of the
+	// certs in the chain are expired.
+	if ca.firstCrtExpiration.Before(c.NotAfter) {
+		c.NotAfter = ca.firstCrtExpiration
+	}
 	return c
 }
 
@@ -232,7 +260,11 @@ func createTemplate(
 	// anyway since a P-256 scalar is only 256 bits long.
 	const SignatureAlgorithm = x509.ECDSAWithSHA256
 
-	notBefore, notAfter := v.Window(time.Now())
+	if v.ValidFrom == nil {
+		now := time.Now()
+		v.ValidFrom = &now
+	}
+	notBefore, notAfter := v.Window(*v.ValidFrom)
 
 	return &x509.Certificate{
 		SerialNumber:       big.NewInt(int64(serialNumber)),

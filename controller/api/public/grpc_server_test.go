@@ -8,10 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/duration"
-	"github.com/linkerd/linkerd2/controller/api/discovery"
-	discoveryPb "github.com/linkerd/linkerd2/controller/gen/controller/discovery"
 	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/controller/k8s"
 	pkgK8s "github.com/linkerd/linkerd2/pkg/k8s"
@@ -100,7 +97,7 @@ metadata:
   labels:
     pod-template-hash: hash-meshed
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: ReplicaSet
     name: rs-emojivoto-meshed
 status:
@@ -115,20 +112,20 @@ metadata:
   labels:
     pod-template-hash: hash-not-meshed
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: ReplicaSet
     name: rs-emojivoto-not-meshed
 status:
   phase: Pending
   podIP: 4.3.2.1
 `, `
-apiVersion: apps/v1beta2
+apiVersion: apps/v1
 kind: ReplicaSet
 metadata:
   name: rs-emojivoto-meshed
   namespace: emojivoto
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: Deployment
     name: meshed-deployment
 spec:
@@ -136,13 +133,13 @@ spec:
     matchLabels:
       pod-template-hash: hash-meshed
 `, `
-apiVersion: apps/v1beta2
+apiVersion: apps/v1
 kind: ReplicaSet
 metadata:
   name: rs-emojivoto-not-meshed
   namespace: emojivoto
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: Deployment
     name: not-meshed-deployment
 spec:
@@ -247,7 +244,7 @@ metadata:
   labels:
     pod-template-hash: hash-meshed
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: Deployment
     name: meshed-deployment
 status:
@@ -283,7 +280,7 @@ metadata:
   labels:
     pod-template-hash: hash-meshed
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: Deployment
     name: meshed-deployment
 status:
@@ -330,7 +327,7 @@ metadata:
   labels:
     pod-template-hash: hash-meshed
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: Deployment
     name: meshed-deployment
 status:
@@ -374,7 +371,7 @@ metadata:
   labels:
     pod-template-hash: hash-meshed
   ownerReferences:
-  - apiVersion: extensions/v1beta1
+  - apiVersion: apps/v1
     kind: Deployment
     name: meshed-deployment
 status:
@@ -397,14 +394,14 @@ status:
 				t.Fatalf("NewFakeAPI returned an error: %s", err)
 			}
 
-			mProm := mockProm{Res: exp.promRes}
+			mProm := MockProm{Res: exp.promRes}
 
 			fakeGrpcServer := newGrpcServer(
 				&mProm,
 				nil,
-				nil,
 				k8sAPI,
 				"linkerd",
+				"mycluster.local",
 				[]string{},
 			)
 
@@ -430,7 +427,7 @@ status:
 }
 
 // TODO: consider refactoring with expectedStatRPC.verifyPromQueries
-func verifyPromQueries(mProm *mockProm, namespace string) error {
+func verifyPromQueries(mProm *MockProm, namespace string) error {
 	namespaceSelector := fmt.Sprintf("namespace=\"%s\"", namespace)
 	for _, element := range mProm.QueriesExecuted {
 		if strings.Contains(element, namespaceSelector) {
@@ -502,11 +499,11 @@ metadata:
 			}
 
 			fakeGrpcServer := newGrpcServer(
-				&mockProm{},
-				nil,
+				&MockProm{},
 				nil,
 				k8sAPI,
 				"linkerd",
+				"mycluster.local",
 				[]string{},
 			)
 
@@ -524,54 +521,6 @@ metadata:
 	})
 }
 
-type endpointsExpected struct {
-	err error
-	req *discoveryPb.EndpointsParams
-	res *discoveryPb.EndpointsResponse
-}
-
-func TestEndpoints(t *testing.T) {
-	t.Run("Queries to the Endpoints endpoint", func(t *testing.T) {
-		expectations := []endpointsExpected{
-			{
-				err: nil,
-				req: &discoveryPb.EndpointsParams{},
-				res: &discoveryPb.EndpointsResponse{},
-			},
-		}
-
-		for _, exp := range expectations {
-			k8sAPI, err := k8s.NewFakeAPI()
-			if err != nil {
-				t.Fatalf("NewFakeAPI returned an error: %s", err)
-			}
-			k8sAPI.Sync()
-
-			discoveryClient := &discovery.MockDiscoveryClient{
-				EndpointsResponseToReturn: exp.res,
-			}
-
-			fakeGrpcServer := newGrpcServer(
-				&mockProm{},
-				nil,
-				discoveryClient,
-				k8sAPI,
-				"linkerd",
-				[]string{},
-			)
-
-			rsp, err := fakeGrpcServer.Endpoints(context.TODO(), exp.req)
-			if !reflect.DeepEqual(err, exp.err) {
-				t.Fatalf("Expected error: %s, Got: %s", exp.err, err)
-			}
-
-			if !proto.Equal(exp.res, rsp) {
-				t.Fatalf("Unexpected response: [%+v] != [%+v]", exp.res, rsp)
-			}
-		}
-	})
-}
-
 func TestConfig(t *testing.T) {
 	t.Run("Configs are parsed and returned", func(t *testing.T) {
 		k8sAPI, err := k8s.NewFakeAPI()
@@ -580,11 +529,11 @@ func TestConfig(t *testing.T) {
 		}
 
 		fakeGrpcServer := newGrpcServer(
-			&mockProm{},
-			nil,
+			&MockProm{},
 			nil,
 			k8sAPI,
 			"linkerd",
+			"mycluster.local",
 			[]string{},
 		)
 		fakeGrpcServer.mountPathGlobalConfig = "testdata/global.conf.json"
@@ -602,13 +551,13 @@ func TestConfig(t *testing.T) {
 			t.Fatalf("Unexpected response: \"%s\" != \"%s\"", expectedVersion, v)
 		}
 
-		expectedPort := uint32(123)
-		ports := rsp.GetProxy().GetIgnoreOutboundPorts()
-		if len(ports) != 1 {
+		expectedPort := "123"
+		portRanges := rsp.GetProxy().GetIgnoreOutboundPorts()
+		if len(portRanges) != 1 {
 			t.Fatal("Unexpected response: didn't get the outbound port")
 		}
-		if p := ports[0].GetPort(); p != expectedPort {
-			t.Fatalf("Unexpected response: %d != %d", expectedPort, p)
+		if p := portRanges[0].GetPortRange(); p != expectedPort {
+			t.Fatalf("Unexpected response: %s != %s", expectedPort, p)
 		}
 	})
 }

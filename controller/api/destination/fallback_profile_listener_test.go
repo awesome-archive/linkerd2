@@ -3,7 +3,8 @@ package destination
 import (
 	"testing"
 
-	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha1"
+	"github.com/linkerd/linkerd2/controller/api/destination/watcher"
+	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -104,7 +105,7 @@ func TestFallbackProfileListener(t *testing.T) {
 
 }
 
-func newListeners() (profileUpdateListener, profileUpdateListener, *mockListener) {
+func newListeners() (watcher.ProfileUpdateListener, watcher.ProfileUpdateListener, *mockListener) {
 	listener := &mockListener{
 		received: []*sp.ServiceProfile{},
 	}

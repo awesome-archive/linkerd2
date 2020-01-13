@@ -78,12 +78,16 @@ var (
 //////////////////////
 
 func TestCliTap(t *testing.T) {
-	out, _, err := TestHelper.LinkerdRun("inject", "--manual", "testdata/tap_application.yaml")
+	out, stderr, err := TestHelper.LinkerdRun("inject", "--manual", "testdata/tap_application.yaml")
 	if err != nil {
-		t.Fatalf("linkerd inject command failed\n%s", out)
+		t.Fatalf("linkerd inject command failed\n%s\n%s", out, stderr)
 	}
 
 	prefixedNs := TestHelper.GetTestNamespace("tap-test")
+	err = TestHelper.CreateDataPlaneNamespaceIfNotExists(prefixedNs, nil)
+	if err != nil {
+		t.Fatalf("failed to create %s namespace: %s", prefixedNs, err)
+	}
 	out, err = TestHelper.KubectlApply(out, prefixedNs)
 	if err != nil {
 		t.Fatalf("kubectl apply command failed\n%s", out)
@@ -109,6 +113,23 @@ func TestCliTap(t *testing.T) {
 		err = validateExpected(events, expectedT1)
 		if err != nil {
 			t.Fatal(err.Error())
+		}
+	})
+
+	t.Run("tap a disabled deployment", func(t *testing.T) {
+		out, stderr, err := TestHelper.LinkerdRun("tap", "deploy/t4", "--namespace", prefixedNs)
+		if out != "" {
+			t.Fatalf("Unexpected output: %s", out)
+		}
+		if err == nil {
+			t.Fatal("Expected an error, got none")
+		}
+		if stderr == "" {
+			t.Fatal("Expected an error, got none")
+		}
+		expectedErr := "Error: all pods found for deployment/t4 have tapping disabled"
+		if errs := strings.Split(stderr, "\n"); errs[0] != expectedErr {
+			t.Fatalf("Expected [%s], got: %s", expectedErr, errs[0])
 		}
 	})
 
@@ -236,7 +257,7 @@ func validateExpected(events []*tapEvent, expectedEvent tapEvent) error {
 	}
 	for _, event := range events {
 		if *event != expectedEvent {
-			return fmt.Errorf("Unexpected tap event [%+v]", *event)
+			return fmt.Errorf("Unexpected tap event [%+v]; expected=[%+v]", *event, expectedEvent)
 		}
 	}
 	return nil

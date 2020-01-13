@@ -48,6 +48,7 @@ func testUninjectAndInject(t *testing.T, tc testCase) {
 		configs:             tc.testInjectConfig,
 		overrideAnnotations: tc.overrideAnnotations,
 		enableDebugSidecar:  tc.enableDebugSidecarFlag,
+		allowNsInject:       true,
 	}
 
 	if exitCode := uninjectAndInject([]io.Reader{read}, report, output, transformer); exitCode != 0 {
@@ -60,7 +61,12 @@ func testUninjectAndInject(t *testing.T, tc testCase) {
 }
 
 func testInstallConfig() *pb.All {
-	_, c, err := testInstallOptions().validateAndBuild("", nil)
+	installOptions, err := testInstallOptions()
+	if err != nil {
+		log.Fatalf("Unexpected error: %v", err)
+	}
+
+	_, c, err := installOptions.validateAndBuild("", nil)
 	if err != nil {
 		log.Fatalf("test install options must be valid: %s", err)
 	}
@@ -95,6 +101,17 @@ func TestUninjectAndInject(t *testing.T) {
 	noInitContainerConfig := testInstallConfig()
 	noInitContainerConfig.Proxy.ProxyVersion = defaultConfig.Proxy.ProxyVersion
 	noInitContainerConfig.Global.CniEnabled = true
+
+	proxyIgnorePortsOptions, err := testInstallOptions()
+	if err != nil {
+		log.Fatalf("Unexpected error: %v", err)
+	}
+	proxyIgnorePortsOptions.ignoreInboundPorts = []string{"22", "8100-8102"}
+	proxyIgnorePortsOptions.ignoreOutboundPorts = []string{"5432"}
+	_, proxyIgnorePortsConfig, err := proxyIgnorePortsOptions.validateAndBuild("", nil)
+	if err != nil {
+		log.Fatalf("test install proxy-ignore options must be valid: %s", err)
+	}
 
 	testCases := []testCase{
 		{
@@ -156,6 +173,13 @@ func TestUninjectAndInject(t *testing.T) {
 			inputFileName:    "inject_emojivoto_deployment_hostNetwork_true.input.yml",
 			goldenFileName:   "inject_emojivoto_deployment_hostNetwork_true.input.yml",
 			reportFileName:   "inject_emojivoto_deployment_hostNetwork_true.report",
+			injectProxy:      true,
+			testInjectConfig: defaultConfig,
+		},
+		{
+			inputFileName:    "inject_emojivoto_deployment_capabilities.input.yml",
+			goldenFileName:   "inject_emojivoto_deployment_capabilities.golden.yml",
+			reportFileName:   "inject_emojivoto_deployment.report",
 			injectProxy:      true,
 			testInjectConfig: defaultConfig,
 		},
@@ -258,6 +282,46 @@ func TestUninjectAndInject(t *testing.T) {
 			testInjectConfig:       defaultConfig,
 			enableDebugSidecarFlag: true,
 		},
+		{
+			inputFileName:          "inject_tap_deployment.input.yml",
+			goldenFileName:         "inject_tap_deployment_debug.golden.yml",
+			reportFileName:         "inject_tap_deployment_debug.report",
+			injectProxy:            true,
+			testInjectConfig:       defaultConfig,
+			enableDebugSidecarFlag: true,
+		},
+		{
+			inputFileName:    "inject_emojivoto_namespace_good.input.yml",
+			goldenFileName:   "inject_emojivoto_namespace_good.golden.yml",
+			reportFileName:   "inject_emojivoto_namespace_good.golden.report",
+			injectProxy:      false,
+			testInjectConfig: defaultConfig,
+		},
+		{
+			inputFileName:    "inject_emojivoto_namespace_good.input.yml",
+			goldenFileName:   "inject_emojivoto_namespace_overidden_good.golden.yml",
+			reportFileName:   "inject_emojivoto_namespace_good.golden.report",
+			injectProxy:      false,
+			testInjectConfig: defaultConfig,
+			overrideAnnotations: map[string]string{
+				k8s.IdentityModeAnnotation: "default",
+				k8s.CreatedByAnnotation:    "linkerd/cli dev-undefined",
+			},
+		},
+		{
+			inputFileName:    "inject_emojivoto_deployment.input.yml",
+			goldenFileName:   "inject_emojivoto_deployment_proxyignores.golden.yml",
+			reportFileName:   "inject_emojivoto_deployment.report",
+			injectProxy:      true,
+			testInjectConfig: proxyIgnorePortsConfig,
+		},
+		{
+			inputFileName:    "inject_emojivoto_pod.input.yml",
+			goldenFileName:   "inject_emojivoto_pod_proxyignores.golden.yml",
+			reportFileName:   "inject_emojivoto_pod.report",
+			injectProxy:      true,
+			testInjectConfig: proxyIgnorePortsConfig,
+		},
 	}
 
 	for i, tc := range testCases {
@@ -278,6 +342,7 @@ type injectCmd struct {
 	stdErrGoldenFileName string
 	stdOutGoldenFileName string
 	exitCode             int
+	injectProxy          bool
 }
 
 func testInjectCmd(t *testing.T, tc injectCmd) {
@@ -293,7 +358,7 @@ func testInjectCmd(t *testing.T, tc injectCmd) {
 	}
 
 	transformer := &resourceTransformerInject{
-		injectProxy: true,
+		injectProxy: tc.injectProxy,
 		configs:     testConfig,
 	}
 	exitCode := runInjectCmd([]io.Reader{in}, errBuffer, outBuffer, transformer)
@@ -316,12 +381,20 @@ func TestRunInjectCmd(t *testing.T) {
 			inputFileName:        "inject_gettest_deployment.bad.input.yml",
 			stdErrGoldenFileName: "inject_gettest_deployment.bad.golden",
 			exitCode:             1,
+			injectProxy:          true,
+		},
+		{
+			inputFileName:        "inject_tap_deployment.input.yml",
+			stdErrGoldenFileName: "inject_tap_deployment.bad.golden",
+			exitCode:             1,
+			injectProxy:          false,
 		},
 		{
 			inputFileName:        "inject_gettest_deployment.good.input.yml",
 			stdOutGoldenFileName: "inject_gettest_deployment.good.golden.yml",
 			stdErrGoldenFileName: "inject_gettest_deployment.good.golden.stderr",
 			exitCode:             0,
+			injectProxy:          true,
 		},
 	}
 
@@ -432,6 +505,30 @@ func TestInjectFilePath(t *testing.T) {
 	t.Run("read from folder --verbose", func(t *testing.T) {
 		testReadFromFolder(t, resourceFolder, expectedFolder)
 	})
+}
+
+func TestValidURL(t *testing.T) {
+	// if the string follows a URL pattern, true has to be returned
+	// if not false is returned
+
+	tests := map[string]bool{
+		"http://www.linkerd.io":  true,
+		"https://www.linkerd.io": true,
+		"www.linkerd.io/":        false,
+		"~/foo/bar.yaml":         false,
+		"./foo/bar.yaml":         false,
+		"/foo/bar/baz.yml":       false,
+		"../foo/bar/baz.yaml":    false,
+		"https//":                false,
+	}
+
+	for url, expectedValue := range tests {
+		value := isValidURL(url)
+		if value != expectedValue {
+			t.Errorf("Result mismatch for %s. expected %v, but got %v", url, expectedValue, value)
+		}
+	}
+
 }
 
 func TestWalk(t *testing.T) {

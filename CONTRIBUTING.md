@@ -8,23 +8,24 @@ If you have a question about Linkerd2 or have encountered problems using it,
 start by [asking a question in the forums][discourse] or join us in the
 [#linkerd2 Slack channel][slack].
 
-## Certificate of Origin ##
+## Developer Certificate of Origin ##
 
-By contributing to this project you agree to the Developer Certificate of
-Origin (DCO). This document was created by the Linux Kernel community and is a
-simple statement that you, as a contributor, have the legal right to make the
-contribution. See the [DCO](DCO) file for details.
+To contribute to this project, you must agree to the Developer Certificate of
+Origin (DCO) for each commit you make. The DCO is a simple statement that you,
+as a contributor, have the legal right to make the contribution.
 
-In practice, just add a line to every git commit message:
+See the [DCO](DCO) file for the full text of what you must agree to.
+
+To signify that you agree to the DCO for a commit, you add a line to the
+git commit message:
 
 ```
 Signed-off-by: Jane Smith <jane.smith@example.com>
 ```
 
-Use your real name (sorry, no pseudonyms or anonymous contributions).
-
-If you set your `user.name` and `user.email` git configs, you can sign your
-commit automatically with `git commit -s`.
+In most cases, you can add this signoff to your commit automatically with the
+`-s` flag to `git commit`. You must use your real name and a reachable email
+address (sorry, no pseudonyms or anonymous contributions).
 
 ## Submitting a Pull Request ##
 
@@ -95,10 +96,21 @@ thought of as being the motivation for your change.
 
 Describe the modifications you've made.
 
+If this PR changes a behavior, it is helpful to describe the difference between
+the old behavior and the new behavior. Provide before and after screenshots,
+example CLI output, or changed YAML where applicable.
+
+Describe any implementation changes which are particularly complex or
+unintuitive.
+
+List any follow-up work that will need to be done in a future PR and link to
+any relevant Github issues.
+
 #### Validation ####
 
-Describe the testing you've done to validate your change.  Performance-related
-changes should include before- and after- benchmark results.
+Describe the testing you've done to validate your change.  Give instructions
+for reviewers to replicate your tests.  Performance-related changes should
+include before- and after- benchmark results.
 
 [discourse]: https://discourse.linkerd.io/c/linkerd2
 [issue]: https://github.com/linkerd/linkerd2/issues/new

@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
-	discoveryPb "github.com/linkerd/linkerd2/controller/gen/controller/discovery"
 	pb "github.com/linkerd/linkerd2/controller/gen/public"
+	"github.com/linkerd/linkerd2/pkg/protohttp"
 )
 
 type mockTransport struct {
@@ -71,7 +71,7 @@ func TestFromByteStreamToProtocolBuffers(t *testing.T) {
 		var protobufMessageToBeFilledWithData pb.VersionInfo
 		reader := bufferedReader(t, &versionInfo)
 
-		err := fromByteStreamToProtocolBuffers(reader, &protobufMessageToBeFilledWithData)
+		err := protohttp.FromByteStreamToProtocolBuffers(reader, &protobufMessageToBeFilledWithData)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -114,7 +114,7 @@ func TestFromByteStreamToProtocolBuffers(t *testing.T) {
 		reader := bufferedReader(t, &msg)
 
 		protobufMessageToBeFilledWithData := &pb.StatSummaryResponse{}
-		err := fromByteStreamToProtocolBuffers(reader, protobufMessageToBeFilledWithData)
+		err := protohttp.FromByteStreamToProtocolBuffers(reader, protobufMessageToBeFilledWithData)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -125,7 +125,7 @@ func TestFromByteStreamToProtocolBuffers(t *testing.T) {
 
 		var protobufMessageToBeFilledWithData pb.ApiError
 		reader := bufferedReader(t, &apiError)
-		err := fromByteStreamToProtocolBuffers(reader, &protobufMessageToBeFilledWithData)
+		err := protohttp.FromByteStreamToProtocolBuffers(reader, &protobufMessageToBeFilledWithData)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -147,41 +147,11 @@ func TestFromByteStreamToProtocolBuffers(t *testing.T) {
 		reader := bufferedReader(t, versionInfo)
 
 		protobufMessageToBeFilledWithData := &pb.StatSummaryResponse{}
-		err := fromByteStreamToProtocolBuffers(reader, protobufMessageToBeFilledWithData)
+		err := protohttp.FromByteStreamToProtocolBuffers(reader, protobufMessageToBeFilledWithData)
 		if err == nil {
 			t.Fatal("Expecting error, got nothing")
 		}
 	})
-}
-
-func TestEndpointsRequest(t *testing.T) {
-	mockTransport := &mockTransport{}
-	mockTransport.responseToReturn = &http.Response{
-		StatusCode: 200,
-		Body:       ioutil.NopCloser(bufferedReader(t, &pb.Empty{})),
-	}
-	mockHTTPClient := &http.Client{
-		Transport: mockTransport,
-	}
-	apiURL := &url.URL{
-		Scheme: "http",
-		Host:   "some-hostname",
-		Path:   "/",
-	}
-	client, err := newClient(apiURL, mockHTTPClient, "linkerd")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	resp, err := client.Endpoints(context.Background(), &discoveryPb.EndpointsParams{})
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	expectedResp := &discoveryPb.EndpointsResponse{}
-	if !proto.Equal(resp, expectedResp) {
-		t.Fatalf("Expected response [%v], got: [%v]", expectedResp, resp)
-	}
 }
 
 func bufferedReader(t *testing.T, msg proto.Message) *bufio.Reader {
@@ -190,7 +160,7 @@ func bufferedReader(t *testing.T, msg proto.Message) *bufio.Reader {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	payload := serializeAsPayload(msgBytes)
+	payload := protohttp.SerializeAsPayload(msgBytes)
 
 	return bufio.NewReader(bytes.NewReader(payload))
 }

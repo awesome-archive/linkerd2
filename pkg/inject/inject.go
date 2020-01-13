@@ -2,77 +2,68 @@ package inject
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/linkerd/linkerd2/controller/gen/config"
+	"github.com/linkerd/linkerd2/pkg/charts"
+	l5dcharts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/version"
 	log "github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/api/extensions/v1beta1"
+	batchv1beta1 "k8s.io/api/batch/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	k8sResource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/helm/pkg/chartutil"
 	"sigs.k8s.io/yaml"
 )
 
 const (
-	// localhostDNSOverride allows override of the destinationDNS. This
-	// must be in absolute form for the proxy to special-case it.
-	localhostDNSOverride = "localhost."
+	proxyInitResourceRequestCPU    = "10m"
+	proxyInitResourceRequestMemory = "10Mi"
+	proxyInitResourceLimitCPU      = "100m"
+	proxyInitResourceLimitMemory   = "50Mi"
 
-	controllerDeployName = "linkerd-controller"
-	identityDeployName   = "linkerd-identity"
-
-	// defaultKeepaliveMs is used in the proxy configuration for remote connections
-	defaultKeepaliveMs = 10000
-
-	defaultProfileSuffix  = "."
-	internalProfileSuffix = "svc.cluster.local."
-
-	envLog                = "LINKERD2_PROXY_LOG"
-	envControlListenAddr  = "LINKERD2_PROXY_CONTROL_LISTEN_ADDR"
-	envAdminListenAddr    = "LINKERD2_PROXY_ADMIN_LISTEN_ADDR"
-	envOutboundListenAddr = "LINKERD2_PROXY_OUTBOUND_LISTEN_ADDR"
-	envInboundListenAddr  = "LINKERD2_PROXY_INBOUND_LISTEN_ADDR"
-
-	envInboundAcceptKeepAlive   = "LINKERD2_PROXY_INBOUND_ACCEPT_KEEPALIVE"
-	envOutboundConnectKeepAlive = "LINKERD2_PROXY_OUTBOUND_CONNECT_KEEPALIVE"
-
-	envDestinationContext         = "LINKERD2_PROXY_DESTINATION_CONTEXT"
-	envDestinationProfileSuffixes = "LINKERD2_PROXY_DESTINATION_PROFILE_SUFFIXES"
-	envDestinationSvcAddr         = "LINKERD2_PROXY_DESTINATION_SVC_ADDR"
-	envDestinationSvcName         = "LINKERD2_PROXY_DESTINATION_SVC_NAME"
-
-	// destinationAPIPort is the port exposed by the linkerd-destination service
-	destinationAPIPort = 8086
-
-	envIdentityDisabled     = "LINKERD2_PROXY_IDENTITY_DISABLED"
-	envIdentityDir          = "LINKERD2_PROXY_IDENTITY_DIR"
-	envIdentityLocalName    = "LINKERD2_PROXY_IDENTITY_LOCAL_NAME"
-	envIdentitySvcAddr      = "LINKERD2_PROXY_IDENTITY_SVC_ADDR"
-	envIdentitySvcName      = "LINKERD2_PROXY_IDENTITY_SVC_NAME"
-	envIdentityTokenFile    = "LINKERD2_PROXY_IDENTITY_TOKEN_FILE"
-	envIdentityTrustAnchors = "LINKERD2_PROXY_IDENTITY_TRUST_ANCHORS"
-
-	identityAPIPort = 8080
+	traceDefaultSvcAccount = "default"
 )
 
-var injectableKinds = []string{
-	k8s.DaemonSet,
-	k8s.Deployment,
-	k8s.Job,
-	k8s.Pod,
-	k8s.ReplicaSet,
-	k8s.ReplicationController,
-	k8s.StatefulSet,
-}
+var (
+	rTrail = regexp.MustCompile(`\},\s*\]`)
+
+	// ProxyAnnotations is the list of possible annotations that can be applied on a pod or namespace
+	ProxyAnnotations = []string{
+		k8s.ProxyAdminPortAnnotation,
+		k8s.ProxyControlPortAnnotation,
+		k8s.ProxyDisableIdentityAnnotation,
+		k8s.ProxyDisableTapAnnotation,
+		k8s.ProxyEnableDebugAnnotation,
+		k8s.ProxyEnableExternalProfilesAnnotation,
+		k8s.ProxyImagePullPolicyAnnotation,
+		k8s.ProxyInboundPortAnnotation,
+		k8s.ProxyInitImageAnnotation,
+		k8s.ProxyInitImageVersionAnnotation,
+		k8s.ProxyOutboundPortAnnotation,
+		k8s.ProxyCPULimitAnnotation,
+		k8s.ProxyCPURequestAnnotation,
+		k8s.ProxyImageAnnotation,
+		k8s.ProxyLogLevelAnnotation,
+		k8s.ProxyMemoryLimitAnnotation,
+		k8s.ProxyMemoryRequestAnnotation,
+		k8s.ProxyUIDAnnotation,
+		k8s.ProxyVersionOverrideAnnotation,
+		k8s.ProxyIgnoreInboundPortsAnnotation,
+		k8s.ProxyIgnoreOutboundPortsAnnotation,
+		k8s.ProxyTraceCollectorSvcAddrAnnotation,
+	}
+)
 
 // Origin defines where the input YAML comes from. Refer the ResourceConfig's
 // 'origin' field
@@ -94,18 +85,14 @@ const (
 
 // OwnerRetrieverFunc is a function that returns a pod's owner reference
 // kind and name
-type OwnerRetrieverFunc func(*v1.Pod) (string, string)
+type OwnerRetrieverFunc func(*corev1.Pod) (string, string)
 
 // ResourceConfig contains the parsed information for a given workload
 type ResourceConfig struct {
-	configs                *config.All
-	nsAnnotations          map[string]string
-	destinationDNSOverride string
-	identityDNSOverride    string
-	proxyOutboundCapacity  map[string]uint
-	ownerRetriever         OwnerRetrieverFunc
-	origin                 Origin
-	debugSidecar           *v1.Container
+	configs        *config.All
+	nsAnnotations  map[string]string
+	ownerRetriever OwnerRetrieverFunc
+	origin         Origin
 
 	workload struct {
 		obj      runtime.Object
@@ -114,39 +101,41 @@ type ResourceConfig struct {
 		// Meta is the workload's metadata. It's exported so that metadata of
 		// non-workload resources can be unmarshalled by the YAML parser
 		Meta *metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+		ownerRef *metav1.OwnerReference
 	}
 
 	pod struct {
 		meta        *metav1.ObjectMeta
 		labels      map[string]string
 		annotations map[string]string
-		spec        *v1.PodSpec
+		spec        *corev1.PodSpec
 	}
+}
+
+type patch struct {
+	l5dcharts.Values
+	PathPrefix            string                    `json:"pathPrefix"`
+	AddRootAnnotations    bool                      `json:"addRootAnnotations"`
+	Annotations           map[string]string         `json:"annotations"`
+	AddRootLabels         bool                      `json:"addRootLabels"`
+	AddRootInitContainers bool                      `json:"addRootInitContainers"`
+	AddRootVolumes        bool                      `json:"addRootVolumes"`
+	Labels                map[string]string         `json:"labels"`
+	DebugContainer        *l5dcharts.DebugContainer `json:"debugContainer"`
 }
 
 // NewResourceConfig creates and initializes a ResourceConfig
 func NewResourceConfig(configs *config.All, origin Origin) *ResourceConfig {
 	config := &ResourceConfig{
-		configs:               configs,
-		proxyOutboundCapacity: map[string]uint{},
-		origin:                origin,
+		configs: configs,
+		origin:  origin,
 	}
 
 	config.pod.meta = &metav1.ObjectMeta{}
 	config.pod.labels = map[string]string{k8s.ControllerNSLabel: configs.GetGlobal().GetLinkerdNamespace()}
 	config.pod.annotations = map[string]string{}
 	return config
-}
-
-// WithDebugSidecar enriches ResourceConfig with a debug sidecar for a resource
-func (conf *ResourceConfig) WithDebugSidecar() *ResourceConfig {
-	conf.debugSidecar = &v1.Container{
-		Name:                     k8s.DebugSidecarName,
-		ImagePullPolicy:          conf.proxyImagePullPolicy(),
-		Image:                    fmt.Sprintf("%s:%s", k8s.DebugSidecarImage, conf.configs.GetGlobal().GetVersion()),
-		TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
-	}
-	return conf
 }
 
 // WithKind enriches ResourceConfig with the workload kind
@@ -162,19 +151,16 @@ func (conf *ResourceConfig) WithNsAnnotations(m map[string]string) *ResourceConf
 	return conf
 }
 
-// WithProxyOutboundCapacity enriches ResourceConfig with a map of image names
-// to capacities, which can be used by the install code to modify the outbound
-// capacity for the prometheus container in the control plane install
-func (conf *ResourceConfig) WithProxyOutboundCapacity(m map[string]uint) *ResourceConfig {
-	conf.proxyOutboundCapacity = m
-	return conf
-}
-
 // WithOwnerRetriever enriches ResourceConfig with a function that allows to retrieve
 // the kind and name of the workload's owner reference
 func (conf *ResourceConfig) WithOwnerRetriever(f OwnerRetrieverFunc) *ResourceConfig {
 	conf.ownerRetriever = f
 	return conf
+}
+
+// GetOwnerRef returns a reference to the resource's owner resource, if any
+func (conf *ResourceConfig) GetOwnerRef() *metav1.OwnerReference {
+	return conf.workload.ownerRef
 }
 
 // AppendPodAnnotations appends the given annotations to the pod spec in conf
@@ -206,46 +192,87 @@ func (conf *ResourceConfig) ParseMetaAndYAML(bytes []byte) (*Report, error) {
 
 // GetPatch returns the JSON patch containing the proxy and init containers specs, if any.
 // If injectProxy is false, only the config.linkerd.io annotations are set.
-func (conf *ResourceConfig) GetPatch(bytes []byte, injectProxy bool) (*Patch, error) {
-	patch := NewPatch(conf.workload.metaType.Kind)
+func (conf *ResourceConfig) GetPatch(injectProxy bool) ([]byte, error) {
+	clusterDomain := conf.configs.GetGlobal().GetClusterDomain()
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+	values := &patch{
+		Values: l5dcharts.Values{
+			Global: &l5dcharts.Global{
+				Namespace:     conf.configs.GetGlobal().GetLinkerdNamespace(),
+				ClusterDomain: clusterDomain,
+			},
+		},
+		Annotations: map[string]string{},
+		Labels:      map[string]string{},
+	}
+	switch strings.ToLower(conf.workload.metaType.Kind) {
+	case k8s.Pod:
+	case k8s.CronJob:
+		values.PathPrefix = "/spec/jobTemplate/spec/template"
+	default:
+		values.PathPrefix = "/spec/template"
+	}
+
 	if conf.pod.spec != nil {
-		conf.injectPodAnnotations(patch)
+		conf.injectPodAnnotations(values)
 		if injectProxy {
-			conf.injectObjectMeta(patch)
-			conf.injectPodSpec(patch)
+			conf.injectObjectMeta(values)
+			conf.injectPodSpec(values)
 		}
 	}
 
-	return patch, nil
-}
-
-// KindInjectable returns true if the resource in conf can be injected with a proxy
-func (conf *ResourceConfig) KindInjectable() bool {
-	for _, kind := range injectableKinds {
-		if strings.ToLower(conf.workload.metaType.Kind) == kind {
-			return true
-		}
+	rawValues, err := yaml.Marshal(values)
+	if err != nil {
+		return nil, err
 	}
-	return false
+
+	files := []*chartutil.BufferedFile{
+		{Name: chartutil.ChartfileName},
+		{Name: "requirements.yaml"},
+		{Name: "templates/patch.json"},
+	}
+
+	chart := &charts.Chart{
+		Name:      "patch",
+		Dir:       "patch",
+		Namespace: values.Global.Namespace,
+		RawValues: rawValues,
+		Files:     files,
+	}
+	buf, err := chart.Render()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get rid of invalid trailing commas
+	res := rTrail.ReplaceAll(buf.Bytes(), []byte("}\n]"))
+
+	return res, nil
 }
 
-// Note this switch must be kept in sync with injectableKinds (declared above)
+// Note this switch also defines what kinds are injectable
 func (conf *ResourceConfig) getFreshWorkloadObj() runtime.Object {
 	switch strings.ToLower(conf.workload.metaType.Kind) {
 	case k8s.Deployment:
-		return &v1beta1.Deployment{}
+		return &appsv1.Deployment{}
 	case k8s.ReplicationController:
-		return &v1.ReplicationController{}
+		return &corev1.ReplicationController{}
 	case k8s.ReplicaSet:
-		return &v1beta1.ReplicaSet{}
+		return &appsv1.ReplicaSet{}
 	case k8s.Job:
 		return &batchv1.Job{}
 	case k8s.DaemonSet:
-		return &v1beta1.DaemonSet{}
+		return &appsv1.DaemonSet{}
 	case k8s.StatefulSet:
 		return &appsv1.StatefulSet{}
 	case k8s.Pod:
-		return &v1.Pod{}
+		return &corev1.Pod{}
+	case k8s.Namespace:
+		return &corev1.Namespace{}
+	case k8s.CronJob:
+		return &batchv1beta1.CronJob{}
 	}
 
 	return nil
@@ -295,18 +322,9 @@ func (conf *ResourceConfig) parse(bytes []byte) error {
 	obj := conf.getFreshWorkloadObj()
 
 	switch v := obj.(type) {
-	case *v1beta1.Deployment:
+	case *appsv1.Deployment:
 		if err := yaml.Unmarshal(bytes, v); err != nil {
 			return err
-		}
-
-		if v.Namespace == conf.configs.GetGlobal().GetLinkerdNamespace() {
-			switch v.Name {
-			case controllerDeployName:
-				conf.destinationDNSOverride = localhostDNSOverride
-			case identityDeployName:
-				conf.identityDNSOverride = localhostDNSOverride
-			}
 		}
 
 		conf.workload.obj = v
@@ -314,7 +332,7 @@ func (conf *ResourceConfig) parse(bytes []byte) error {
 		conf.pod.labels[k8s.ProxyDeploymentLabel] = v.Name
 		conf.complete(&v.Spec.Template)
 
-	case *v1.ReplicationController:
+	case *corev1.ReplicationController:
 		if err := yaml.Unmarshal(bytes, v); err != nil {
 			return err
 		}
@@ -324,7 +342,7 @@ func (conf *ResourceConfig) parse(bytes []byte) error {
 		conf.pod.labels[k8s.ProxyReplicationControllerLabel] = v.Name
 		conf.complete(v.Spec.Template)
 
-	case *v1beta1.ReplicaSet:
+	case *appsv1.ReplicaSet:
 		if err := yaml.Unmarshal(bytes, v); err != nil {
 			return err
 		}
@@ -344,7 +362,7 @@ func (conf *ResourceConfig) parse(bytes []byte) error {
 		conf.pod.labels[k8s.ProxyJobLabel] = v.Name
 		conf.complete(&v.Spec.Template)
 
-	case *v1beta1.DaemonSet:
+	case *appsv1.DaemonSet:
 		if err := yaml.Unmarshal(bytes, v); err != nil {
 			return err
 		}
@@ -364,7 +382,28 @@ func (conf *ResourceConfig) parse(bytes []byte) error {
 		conf.pod.labels[k8s.ProxyStatefulSetLabel] = v.Name
 		conf.complete(&v.Spec.Template)
 
-	case *v1.Pod:
+	case *corev1.Namespace:
+		if err := yaml.Unmarshal(bytes, v); err != nil {
+			return err
+		}
+		conf.workload.obj = v
+		conf.workload.Meta = &v.ObjectMeta
+		// If annotations not present previously
+		if conf.workload.Meta.Annotations == nil {
+			conf.workload.Meta.Annotations = map[string]string{}
+		}
+
+	case *batchv1beta1.CronJob:
+		if err := yaml.Unmarshal(bytes, v); err != nil {
+			return err
+		}
+
+		conf.workload.obj = v
+		conf.workload.Meta = &v.ObjectMeta
+		conf.pod.labels[k8s.ProxyCronJobLabel] = v.Name
+		conf.complete(&v.Spec.JobTemplate.Spec.Template)
+
+	case *corev1.Pod:
 		if err := yaml.Unmarshal(bytes, v); err != nil {
 			return err
 		}
@@ -375,6 +414,7 @@ func (conf *ResourceConfig) parse(bytes []byte) error {
 
 		if conf.ownerRetriever != nil {
 			kind, name := conf.ownerRetriever(v)
+			conf.workload.ownerRef = &metav1.OwnerReference{Kind: kind, Name: name}
 			switch kind {
 			case k8s.Deployment:
 				conf.pod.labels[k8s.ProxyDeploymentLabel] = name
@@ -406,213 +446,129 @@ func (conf *ResourceConfig) parse(bytes []byte) error {
 	return nil
 }
 
-func (conf *ResourceConfig) complete(template *v1.PodTemplateSpec) {
+func (conf *ResourceConfig) complete(template *corev1.PodTemplateSpec) {
 	conf.pod.spec = &template.Spec
 	conf.pod.meta = &template.ObjectMeta
 }
 
 // injectPodSpec adds linkerd sidecars to the provided PodSpec.
-func (conf *ResourceConfig) injectPodSpec(patch *Patch) {
-	saVolumeMount := conf.serviceAccountVolumeMount()
-	if !conf.configs.GetGlobal().GetCniEnabled() {
-		conf.injectProxyInit(patch, saVolumeMount)
-	}
-
-	if conf.debugSidecar != nil {
-		patch.addContainer(conf.debugSidecar)
-	}
-
-	proxyUID := conf.proxyUID()
-	sidecar := v1.Container{
-		Name:                     k8s.ProxyContainerName,
-		Image:                    conf.taggedProxyImage(),
-		ImagePullPolicy:          conf.proxyImagePullPolicy(),
-		TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
-		SecurityContext:          &v1.SecurityContext{RunAsUser: &proxyUID},
-		Ports: []v1.ContainerPort{
-			{
-				Name:          k8s.ProxyPortName,
-				ContainerPort: conf.proxyInboundPort(),
-			},
-			{
-				Name:          k8s.ProxyAdminPortName,
-				ContainerPort: conf.proxyAdminPort(),
-			},
+func (conf *ResourceConfig) injectPodSpec(values *patch) {
+	values.Global.Proxy = &l5dcharts.Proxy{
+		Component:              conf.pod.labels[k8s.ProxyDeploymentLabel],
+		EnableExternalProfiles: conf.enableExternalProfiles(),
+		DisableTap:             conf.tapDisabled(),
+		Image: &l5dcharts.Image{
+			Name:       conf.proxyImage(),
+			Version:    conf.proxyVersion(),
+			PullPolicy: conf.proxyImagePullPolicy(),
 		},
-		Resources: conf.proxyResourceRequirements(),
-		Env: []v1.EnvVar{
-			{
-				Name:  envLog,
-				Value: conf.proxyLogLevel(),
-			},
-			{
-				Name:  envDestinationSvcAddr,
-				Value: conf.proxyDestinationAddr(),
-			},
-			{
-				Name:  envControlListenAddr,
-				Value: conf.proxyControlListenAddr(),
-			},
-			{
-				Name:  envAdminListenAddr,
-				Value: conf.proxyAdminListenAddr(),
-			},
-			{
-				Name:  envOutboundListenAddr,
-				Value: conf.proxyOutboundListenAddr(),
-			},
-			{
-				Name:  envInboundListenAddr,
-				Value: conf.proxyInboundListenAddr(),
-			},
-			{
-				Name:  envDestinationProfileSuffixes,
-				Value: conf.proxyDestinationProfileSuffixes(),
-			},
-			{
-				Name:  envInboundAcceptKeepAlive,
-				Value: fmt.Sprintf("%dms", defaultKeepaliveMs),
-			},
-			{
-				Name:  envOutboundConnectKeepAlive,
-				Value: fmt.Sprintf("%dms", defaultKeepaliveMs),
-			},
-			{
-				Name:      "_pod_ns",
-				ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.namespace"}},
-			},
-			{
-				Name:  envDestinationContext,
-				Value: "ns:$(_pod_ns)",
-			},
+		LogLevel: conf.proxyLogLevel(),
+		Ports: &l5dcharts.Ports{
+			Admin:    conf.proxyAdminPort(),
+			Control:  conf.proxyControlPort(),
+			Inbound:  conf.proxyInboundPort(),
+			Outbound: conf.proxyOutboundPort(),
 		},
-		ReadinessProbe: conf.proxyReadinessProbe(),
-		LivenessProbe:  conf.proxyLivenessProbe(),
+		UID:                   conf.proxyUID(),
+		Resources:             conf.proxyResourceRequirements(),
+		WaitBeforeExitSeconds: conf.proxyWaitBeforeExitSeconds(),
 	}
 
-	// Special case if the caller specifies that
-	// LINKERD2_PROXY_OUTBOUND_ROUTER_CAPACITY be set on the pod.
-	// We key off of any container image in the pod. Ideally we would instead key
-	// off of something at the top-level of the PodSpec, but there is nothing
-	// easily identifiable at that level.
-	// Currently this will be set on any proxy that gets injected into a Prometheus pod,
-	// not just the one in Linkerd's Control Plane.
-	for _, container := range conf.pod.spec.Containers {
-		if capacity, ok := conf.proxyOutboundCapacity[container.Image]; ok {
-			sidecar.Env = append(sidecar.Env,
-				v1.EnvVar{
-					Name:  "LINKERD2_PROXY_OUTBOUND_ROUTER_CAPACITY",
-					Value: fmt.Sprintf("%d", capacity),
+	if v := conf.pod.meta.Annotations[k8s.ProxyEnableDebugAnnotation]; v != "" {
+		debug, err := strconv.ParseBool(v)
+		if err != nil {
+			log.Warnf("unrecognized value used for the %s annotation: %s", k8s.ProxyEnableDebugAnnotation, v)
+			debug = false
+		}
+
+		if debug {
+			log.Infof("inject debug container")
+			values.DebugContainer = &l5dcharts.DebugContainer{
+				Image: &l5dcharts.Image{
+					Name:       k8s.DebugSidecarImage,
+					Version:    conf.configs.GetGlobal().GetVersion(),
+					PullPolicy: conf.proxyImagePullPolicy(),
 				},
-			)
-			break
+			}
+		}
+	}
+
+	saVolumeMount := conf.serviceAccountVolumeMount()
+
+	// use the primary container's capabilities to ensure psp compliance, if
+	// enabled
+	if conf.pod.spec.Containers != nil && len(conf.pod.spec.Containers) > 0 {
+		if sc := conf.pod.spec.Containers[0].SecurityContext; sc != nil && sc.Capabilities != nil {
+			values.Global.Proxy.Capabilities = &l5dcharts.Capabilities{
+				Add:  []string{},
+				Drop: []string{},
+			}
+			for _, add := range sc.Capabilities.Add {
+				values.Global.Proxy.Capabilities.Add = append(values.Global.Proxy.Capabilities.Add, string(add))
+			}
+			for _, drop := range sc.Capabilities.Drop {
+				values.Global.Proxy.Capabilities.Drop = append(values.Global.Proxy.Capabilities.Drop, string(drop))
+			}
 		}
 	}
 
 	if saVolumeMount != nil {
-		sidecar.VolumeMounts = []v1.VolumeMount{*saVolumeMount}
+		values.Global.Proxy.SAMountPath = &l5dcharts.SAMountPath{
+			Name:      saVolumeMount.Name,
+			MountPath: saVolumeMount.MountPath,
+			ReadOnly:  saVolumeMount.ReadOnly,
+		}
+	}
+
+	if !conf.configs.GetGlobal().GetCniEnabled() {
+		conf.injectProxyInit(values)
 	}
 
 	idctx := conf.identityContext()
 	if idctx == nil {
-		sidecar.Env = append(sidecar.Env, v1.EnvVar{
-			Name:  envIdentityDisabled,
-			Value: k8s.IdentityModeDisabled,
-		})
-		patch.addContainer(&sidecar)
+		values.Global.Proxy.DisableIdentity = true
 		return
 	}
+	values.Global.IdentityTrustAnchorsPEM = idctx.GetTrustAnchorsPem()
+	values.Global.IdentityTrustDomain = idctx.GetTrustDomain()
+	values.Identity = &l5dcharts.Identity{}
 
-	sidecar.Env = append(sidecar.Env, []v1.EnvVar{
-		{
-			Name:  envIdentityDir,
-			Value: k8s.MountPathEndEntity,
-		},
-		{
-			Name:  envIdentityTrustAnchors,
-			Value: idctx.GetTrustAnchorsPem(),
-		},
-		{
-			Name:  envIdentityTokenFile,
-			Value: k8s.IdentityServiceAccountTokenPath,
-		},
-		{
-			Name:  envIdentitySvcAddr,
-			Value: conf.proxyIdentityAddr(),
-		},
-		{
-			Name:      "_pod_sa",
-			ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "spec.serviceAccountName"}},
-		},
-		{
-			Name:  "_l5d_ns",
-			Value: conf.configs.GetGlobal().GetLinkerdNamespace(),
-		},
-		{
-			Name:  "_l5d_trustdomain",
-			Value: idctx.GetTrustDomain(),
-		},
-		{
-			Name:  envIdentityLocalName,
-			Value: "$(_pod_sa).$(_pod_ns).serviceaccount.identity.$(_l5d_ns).$(_l5d_trustdomain)",
-		},
-		{
-			Name:  envIdentitySvcName,
-			Value: "linkerd-identity.$(_l5d_ns).serviceaccount.identity.$(_l5d_ns).$(_l5d_trustdomain)",
-		},
-		{
-			Name:  envDestinationSvcName,
-			Value: "linkerd-controller.$(_l5d_ns).serviceaccount.identity.$(_l5d_ns).$(_l5d_trustdomain)",
-		},
-	}...)
+	values.AddRootVolumes = len(conf.pod.spec.Volumes) == 0
 
-	if len(conf.pod.spec.Volumes) == 0 {
-		patch.addVolumeRoot()
+	if trace := conf.trace(); trace != nil {
+		log.Infof("tracing enabled: remote service=%s, service account=%s", trace.CollectorSvcAddr, trace.CollectorSvcAccount)
+		values.Global.Proxy.Trace = trace
 	}
-	patch.addVolume(&v1.Volume{
-		Name: k8s.IdentityEndEntityVolumeName,
-		VolumeSource: v1.VolumeSource{
-			EmptyDir: &v1.EmptyDirVolumeSource{
-				Medium: "Memory",
-			},
-		},
-	})
-	sidecar.VolumeMounts = append(sidecar.VolumeMounts, v1.VolumeMount{
-		Name:      k8s.IdentityEndEntityVolumeName,
-		MountPath: k8s.MountPathEndEntity,
-		ReadOnly:  false,
-	})
-	patch.addContainer(&sidecar)
 }
 
-func (conf *ResourceConfig) injectProxyInit(patch *Patch, saVolumeMount *v1.VolumeMount) {
-	nonRoot := false
-	runAsUser := int64(0)
-	initContainer := &v1.Container{
-		Name:                     k8s.InitContainerName,
-		Image:                    conf.taggedProxyInitImage(),
-		ImagePullPolicy:          conf.proxyInitImagePullPolicy(),
-		TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
-		Args:                     conf.proxyInitArgs(),
-		SecurityContext: &v1.SecurityContext{
-			Capabilities: &v1.Capabilities{
-				Add: []v1.Capability{v1.Capability("NET_ADMIN")},
-			},
-			Privileged:   &nonRoot,
-			RunAsNonRoot: &nonRoot,
-			RunAsUser:    &runAsUser,
+func (conf *ResourceConfig) injectProxyInit(values *patch) {
+	values.Global.ProxyInit = &l5dcharts.ProxyInit{
+		Image: &l5dcharts.Image{
+			Name:       conf.proxyInitImage(),
+			PullPolicy: conf.proxyInitImagePullPolicy(),
+			Version:    conf.proxyInitVersion(),
 		},
+		IgnoreInboundPorts:  conf.proxyInboundSkipPorts(),
+		IgnoreOutboundPorts: conf.proxyOutboundSkipPorts(),
+		Resources: &l5dcharts.Resources{
+			CPU: l5dcharts.Constraints{
+				Limit:   proxyInitResourceLimitCPU,
+				Request: proxyInitResourceRequestCPU,
+			},
+			Memory: l5dcharts.Constraints{
+				Limit:   proxyInitResourceLimitMemory,
+				Request: proxyInitResourceRequestMemory,
+			},
+		},
+		Capabilities: values.Global.Proxy.Capabilities,
+		SAMountPath:  values.Global.Proxy.SAMountPath,
 	}
-	if saVolumeMount != nil {
-		initContainer.VolumeMounts = []v1.VolumeMount{*saVolumeMount}
-	}
-	if len(conf.pod.spec.InitContainers) == 0 {
-		patch.addInitContainerRoot()
-	}
-	patch.addInitContainer(initContainer)
+
+	values.AddRootInitContainers = len(conf.pod.spec.InitContainers) == 0
+
 }
 
-func (conf *ResourceConfig) serviceAccountVolumeMount() *v1.VolumeMount {
+func (conf *ResourceConfig) serviceAccountVolumeMount() *corev1.VolumeMount {
 	// Probably always true, but wanna be super-safe
 	if containers := conf.pod.spec.Containers; len(containers) > 0 {
 		for _, vm := range containers[0].VolumeMounts {
@@ -625,34 +581,60 @@ func (conf *ResourceConfig) serviceAccountVolumeMount() *v1.VolumeMount {
 	return nil
 }
 
+func (conf *ResourceConfig) trace() *l5dcharts.Trace {
+	var (
+		svcAddr    = conf.getOverride(k8s.ProxyTraceCollectorSvcAddrAnnotation)
+		svcAccount = conf.getOverride(k8s.ProxyTraceCollectorSvcAccountAnnotation)
+	)
+
+	if svcAddr == "" {
+		return nil
+	}
+
+	if svcAccount == "" {
+		svcAccount = traceDefaultSvcAccount
+	}
+
+	hostAndPort := strings.Split(svcAddr, ":")
+	hostname := strings.Split(hostAndPort[0], ".")
+
+	var ns string
+	if len(hostname) == 1 {
+		ns = conf.pod.meta.Namespace
+	} else {
+		ns = hostname[1]
+	}
+
+	return &l5dcharts.Trace{
+		CollectorSvcAddr:    svcAddr,
+		CollectorSvcAccount: fmt.Sprintf("%s.%s", svcAccount, ns),
+	}
+}
+
 // Given a ObjectMeta, update ObjectMeta in place with the new labels and
 // annotations.
-func (conf *ResourceConfig) injectObjectMeta(patch *Patch) {
-	patch.addPodAnnotation(k8s.ProxyVersionAnnotation, conf.proxyVersion())
+func (conf *ResourceConfig) injectObjectMeta(values *patch) {
+	values.Annotations[k8s.ProxyVersionAnnotation] = conf.proxyVersion()
 
 	if conf.identityContext() != nil {
-		patch.addPodAnnotation(k8s.IdentityModeAnnotation, k8s.IdentityModeDefault)
+		values.Annotations[k8s.IdentityModeAnnotation] = k8s.IdentityModeDefault
 	} else {
-		patch.addPodAnnotation(k8s.IdentityModeAnnotation, k8s.IdentityModeDisabled)
+		values.Annotations[k8s.IdentityModeAnnotation] = k8s.IdentityModeDisabled
 	}
 
 	if len(conf.pod.labels) > 0 {
-		if len(conf.pod.meta.Labels) == 0 {
-			patch.addPodLabelsRoot()
-		}
+		values.AddRootLabels = len(conf.pod.meta.Labels) == 0
 		for _, k := range sortedKeys(conf.pod.labels) {
-			patch.addPodLabel(k, conf.pod.labels[k])
+			values.Labels[k] = conf.pod.labels[k]
 		}
 	}
 }
 
-func (conf *ResourceConfig) injectPodAnnotations(patch *Patch) {
-	if len(conf.pod.meta.Annotations) == 0 {
-		patch.addPodAnnotationsRoot()
-	}
+func (conf *ResourceConfig) injectPodAnnotations(values *patch) {
+	values.AddRootAnnotations = len(conf.pod.meta.Annotations) == 0
 
 	for _, k := range sortedKeys(conf.pod.annotations) {
-		patch.addPodAnnotation(k, conf.pod.annotations[k])
+		values.Annotations[k] = conf.pod.annotations[k]
 
 		// append any additional pod annotations to the pod's meta.
 		// for e.g., annotations that were converted from CLI inject options.
@@ -661,15 +643,10 @@ func (conf *ResourceConfig) injectPodAnnotations(patch *Patch) {
 }
 
 func (conf *ResourceConfig) getOverride(annotation string) string {
-	return conf.pod.meta.Annotations[annotation]
-}
-
-func (conf *ResourceConfig) taggedProxyImage() string {
-	return fmt.Sprintf("%s:%s", conf.proxyImage(), conf.proxyVersion())
-}
-
-func (conf *ResourceConfig) taggedProxyInitImage() string {
-	return fmt.Sprintf("%s:%s", conf.proxyInitImage(), conf.proxyInitVersion())
+	if override := conf.pod.meta.Annotations[annotation]; override != "" {
+		return override
+	}
+	return conf.nsAnnotations[annotation]
 }
 
 func (conf *ResourceConfig) proxyImage() string {
@@ -679,11 +656,11 @@ func (conf *ResourceConfig) proxyImage() string {
 	return conf.configs.GetProxy().GetProxyImage().GetImageName()
 }
 
-func (conf *ResourceConfig) proxyImagePullPolicy() v1.PullPolicy {
+func (conf *ResourceConfig) proxyImagePullPolicy() string {
 	if override := conf.getOverride(k8s.ProxyImagePullPolicyAnnotation); override != "" {
-		return v1.PullPolicy(override)
+		return override
 	}
-	return v1.PullPolicy(conf.configs.GetProxy().GetProxyImage().GetPullPolicy())
+	return conf.configs.GetProxy().GetProxyImage().GetPullPolicy()
 }
 
 func (conf *ResourceConfig) proxyVersion() string {
@@ -700,10 +677,13 @@ func (conf *ResourceConfig) proxyVersion() string {
 }
 
 func (conf *ResourceConfig) proxyInitVersion() string {
-	if version := conf.configs.GetGlobal().GetVersion(); version != "" {
-		return version
+	if override := conf.getOverride(k8s.ProxyInitImageVersionAnnotation); override != "" {
+		return override
 	}
-	return version.Version
+	if v := conf.configs.GetProxy().GetProxyInitImageVersion(); v != "" {
+		return v
+	}
+	return version.ProxyInitVersion
 }
 
 func (conf *ResourceConfig) proxyControlPort() int32 {
@@ -768,12 +748,31 @@ func (conf *ResourceConfig) identityContext() *config.IdentityContext {
 	return conf.configs.GetGlobal().GetIdentityContext()
 }
 
-func (conf *ResourceConfig) proxyResourceRequirements() v1.ResourceRequirements {
-	resources := v1.ResourceRequirements{
-		Requests: v1.ResourceList{},
-		Limits:   v1.ResourceList{},
+func (conf *ResourceConfig) tapDisabled() bool {
+	if override := conf.getOverride(k8s.ProxyDisableTapAnnotation); override != "" {
+		value, err := strconv.ParseBool(override)
+		if err == nil && value {
+			return true
+		}
+	}
+	return false
+}
+
+func (conf *ResourceConfig) proxyWaitBeforeExitSeconds() uint64 {
+	if override := conf.getOverride(k8s.ProxyWaitBeforeExitSecondsAnnotation); override != "" {
+		waitBeforeExitSeconds, err := strconv.ParseUint(override, 10, 64)
+		if nil != err {
+			log.Warnf("unrecognized value used for the %s annotation, uint64 is expected: %s",
+				k8s.ProxyWaitBeforeExitSecondsAnnotation, override)
+		}
+
+		return waitBeforeExitSeconds
 	}
 
+	return 0
+}
+
+func (conf *ResourceConfig) proxyResourceRequirements() *l5dcharts.Resources {
 	var (
 		requestCPU    k8sResource.Quantity
 		requestMemory k8sResource.Quantity
@@ -781,6 +780,7 @@ func (conf *ResourceConfig) proxyResourceRequirements() v1.ResourceRequirements 
 		limitMemory   k8sResource.Quantity
 		err           error
 	)
+	res := &l5dcharts.Resources{}
 
 	if override := conf.getOverride(k8s.ProxyCPURequestAnnotation); override != "" {
 		requestCPU, err = k8sResource.ParseQuantity(override)
@@ -791,7 +791,7 @@ func (conf *ResourceConfig) proxyResourceRequirements() v1.ResourceRequirements 
 		log.Warnf("%s (%s)", err, k8s.ProxyCPURequestAnnotation)
 	}
 	if !requestCPU.IsZero() {
-		resources.Requests["cpu"] = requestCPU
+		res.CPU.Request = requestCPU.String()
 	}
 
 	if override := conf.getOverride(k8s.ProxyMemoryRequestAnnotation); override != "" {
@@ -803,7 +803,7 @@ func (conf *ResourceConfig) proxyResourceRequirements() v1.ResourceRequirements 
 		log.Warnf("%s (%s)", err, k8s.ProxyMemoryRequestAnnotation)
 	}
 	if !requestMemory.IsZero() {
-		resources.Requests["memory"] = requestMemory
+		res.Memory.Request = requestMemory.String()
 	}
 
 	if override := conf.getOverride(k8s.ProxyCPULimitAnnotation); override != "" {
@@ -815,7 +815,7 @@ func (conf *ResourceConfig) proxyResourceRequirements() v1.ResourceRequirements 
 		log.Warnf("%s (%s)", err, k8s.ProxyCPULimitAnnotation)
 	}
 	if !limitCPU.IsZero() {
-		resources.Limits["cpu"] = limitCPU
+		res.CPU.Limit = limitCPU.String()
 	}
 
 	if override := conf.getOverride(k8s.ProxyMemoryLimitAnnotation); override != "" {
@@ -827,43 +827,10 @@ func (conf *ResourceConfig) proxyResourceRequirements() v1.ResourceRequirements 
 		log.Warnf("%s (%s)", err, k8s.ProxyMemoryLimitAnnotation)
 	}
 	if !limitMemory.IsZero() {
-		resources.Limits["memory"] = limitMemory
+		res.Memory.Limit = limitMemory.String()
 	}
 
-	return resources
-}
-
-func (conf *ResourceConfig) proxyDestinationAddr() string {
-	ns := conf.configs.GetGlobal().GetLinkerdNamespace()
-	dns := fmt.Sprintf("linkerd-destination.%s.svc.cluster.local", ns)
-	if conf.destinationDNSOverride != "" {
-		dns = conf.destinationDNSOverride
-	}
-	return fmt.Sprintf("%s:%d", dns, destinationAPIPort)
-}
-
-func (conf *ResourceConfig) proxyIdentityAddr() string {
-	dns := fmt.Sprintf("linkerd-identity.%s.svc.cluster.local", conf.configs.GetGlobal().GetLinkerdNamespace())
-	if conf.identityDNSOverride != "" {
-		dns = conf.identityDNSOverride
-	}
-	return fmt.Sprintf("%s:%d", dns, identityAPIPort)
-}
-
-func (conf *ResourceConfig) proxyControlListenAddr() string {
-	return fmt.Sprintf("0.0.0.0:%d", conf.proxyControlPort())
-}
-
-func (conf *ResourceConfig) proxyInboundListenAddr() string {
-	return fmt.Sprintf("0.0.0.0:%d", conf.proxyInboundPort())
-}
-
-func (conf *ResourceConfig) proxyAdminListenAddr() string {
-	return fmt.Sprintf("0.0.0.0:%d", conf.proxyAdminPort())
-}
-
-func (conf *ResourceConfig) proxyOutboundListenAddr() string {
-	return fmt.Sprintf("127.0.0.1:%d", conf.proxyOutboundPort())
+	return res
 }
 
 func (conf *ResourceConfig) proxyUID() int64 {
@@ -877,44 +844,16 @@ func (conf *ResourceConfig) proxyUID() int64 {
 	return conf.configs.GetProxy().GetProxyUid()
 }
 
-func (conf *ResourceConfig) proxyReadinessProbe() *v1.Probe {
-	return &v1.Probe{
-		Handler: v1.Handler{
-			HTTPGet: &v1.HTTPGetAction{
-				Path: "/ready",
-				Port: intstr.IntOrString{IntVal: conf.proxyAdminPort()},
-			},
-		},
-		InitialDelaySeconds: 2,
-	}
-}
-
-func (conf *ResourceConfig) proxyLivenessProbe() *v1.Probe {
-	return &v1.Probe{
-		Handler: v1.Handler{
-			HTTPGet: &v1.HTTPGetAction{
-				Path: "/metrics",
-				Port: intstr.IntOrString{IntVal: conf.proxyAdminPort()},
-			},
-		},
-		InitialDelaySeconds: 10,
-	}
-}
-
-func (conf *ResourceConfig) proxyDestinationProfileSuffixes() string {
+func (conf *ResourceConfig) enableExternalProfiles() bool {
 	disableExternalProfiles := conf.configs.GetProxy().GetDisableExternalProfiles()
 	if override := conf.getOverride(k8s.ProxyEnableExternalProfilesAnnotation); override != "" {
 		value, err := strconv.ParseBool(override)
 		if err == nil {
-			disableExternalProfiles = !value
+			return value
 		}
 	}
 
-	if disableExternalProfiles {
-		return internalProfileSuffix
-	}
-
-	return defaultProfileSuffix
+	return !disableExternalProfiles
 }
 
 func (conf *ResourceConfig) proxyInitImage() string {
@@ -924,41 +863,11 @@ func (conf *ResourceConfig) proxyInitImage() string {
 	return conf.configs.GetProxy().GetProxyInitImage().GetImageName()
 }
 
-func (conf *ResourceConfig) proxyInitImagePullPolicy() v1.PullPolicy {
+func (conf *ResourceConfig) proxyInitImagePullPolicy() string {
 	if override := conf.getOverride(k8s.ProxyImagePullPolicyAnnotation); override != "" {
-		return v1.PullPolicy(override)
+		return override
 	}
-	return v1.PullPolicy(conf.configs.GetProxy().GetProxyInitImage().GetPullPolicy())
-}
-
-func (conf *ResourceConfig) proxyInitArgs() []string {
-	var (
-		controlPort       = conf.proxyControlPort()
-		adminPort         = conf.proxyAdminPort()
-		inboundPort       = conf.proxyInboundPort()
-		outboundPort      = conf.proxyOutboundPort()
-		outboundSkipPorts = conf.proxyOutboundSkipPorts()
-		proxyUID          = conf.proxyUID()
-	)
-
-	inboundSkipPorts := conf.proxyInboundSkipPorts()
-	if len(inboundSkipPorts) > 0 {
-		inboundSkipPorts += ","
-	}
-	inboundSkipPorts += fmt.Sprintf("%d,%d", controlPort, adminPort)
-
-	initArgs := []string{
-		"--incoming-proxy-port", fmt.Sprintf("%d", inboundPort),
-		"--outgoing-proxy-port", fmt.Sprintf("%d", outboundPort),
-		"--proxy-uid", fmt.Sprintf("%d", proxyUID),
-	}
-	initArgs = append(initArgs, "--inbound-ports-to-ignore", inboundSkipPorts)
-	if len(outboundSkipPorts) > 0 {
-		initArgs = append(initArgs, "--outbound-ports-to-ignore")
-		initArgs = append(initArgs, outboundSkipPorts)
-	}
-
-	return initArgs
+	return conf.configs.GetProxy().GetProxyInitImage().GetPullPolicy()
 }
 
 func (conf *ResourceConfig) proxyInboundSkipPorts() string {
@@ -966,12 +875,11 @@ func (conf *ResourceConfig) proxyInboundSkipPorts() string {
 		return override
 	}
 
-	ports := []string{}
-	for _, port := range conf.configs.GetProxy().GetIgnoreInboundPorts() {
-		portStr := strconv.FormatUint(uint64(port.GetPort()), 10)
-		ports = append(ports, portStr)
+	portRanges := []string{}
+	for _, portOrRange := range conf.configs.GetProxy().GetIgnoreInboundPorts() {
+		portRanges = append(portRanges, portOrRange.GetPortRange())
 	}
-	return strings.Join(ports, ",")
+	return strings.Join(portRanges, ",")
 }
 
 func (conf *ResourceConfig) proxyOutboundSkipPorts() string {
@@ -979,12 +887,27 @@ func (conf *ResourceConfig) proxyOutboundSkipPorts() string {
 		return override
 	}
 
-	ports := []string{}
+	portRanges := []string{}
 	for _, port := range conf.configs.GetProxy().GetIgnoreOutboundPorts() {
-		portStr := strconv.FormatUint(uint64(port.GetPort()), 10)
-		ports = append(ports, portStr)
+		portRanges = append(portRanges, port.GetPortRange())
 	}
-	return strings.Join(ports, ",")
+	return strings.Join(portRanges, ",")
+}
+
+// GetOverriddenConfiguration returns a map of the overridden proxy annotations
+func (conf *ResourceConfig) GetOverriddenConfiguration() map[string]string {
+	proxyOverrideConfig := map[string]string{}
+	for _, annotation := range ProxyAnnotations {
+		proxyOverrideConfig[annotation] = conf.getOverride(annotation)
+	}
+
+	return proxyOverrideConfig
+}
+
+// IsControlPlaneComponent returns true if the component is part of linkerd control plane
+func (conf *ResourceConfig) IsControlPlaneComponent() bool {
+	_, b := conf.pod.meta.Labels[k8s.ControllerComponentLabel]
+	return b
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -996,4 +919,25 @@ func sortedKeys(m map[string]string) []string {
 	sort.Strings(keys)
 
 	return keys
+}
+
+//IsNamespace checks if a given config is a workload of Kind namespace
+func (conf *ResourceConfig) IsNamespace() bool {
+	return strings.ToLower(conf.workload.metaType.Kind) == k8s.Namespace
+}
+
+//InjectNamespace annotates any given Namespace config
+func (conf *ResourceConfig) InjectNamespace(annotations map[string]string) ([]byte, error) {
+	ns, ok := conf.workload.obj.(*corev1.Namespace)
+	if !ok {
+		return nil, errors.New("can't inject namespace. Type assertion failed")
+	}
+	ns.Annotations[k8s.ProxyInjectAnnotation] = k8s.ProxyInjectEnabled
+	//For overriding annotations
+	if len(annotations) > 0 {
+		for annotation, value := range annotations {
+			ns.Annotations[annotation] = value
+		}
+	}
+	return yaml.Marshal(ns)
 }

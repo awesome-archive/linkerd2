@@ -16,28 +16,31 @@ const styles = theme => ({
   root: {
     flexGrow: 1,
     backgroundColor: theme.palette.background.paper,
-    marginBottom: theme.spacing.unit * 3,
+    marginBottom: theme.spacing(3),
   },
 });
 
 class TopRoutesTabs extends React.Component {
-  state = {
-    value: 0,
-  };
+  constructor(props) {
+    super(props);
+    this.state = {
+      value: 0,
+    };
+  }
 
-  handleChange = (_event, value) => {
+  handleChange = (_, value) => {
     this.setState({ value });
   };
 
   renderTopComponent() {
-    let { disableTop, query, pathPrefix, updateUnmeshedSources } = this.props;
+    const { disableTop, query, pathPrefix, updateUnmeshedSources } = this.props;
     if (disableTop) {
       return null;
     }
 
-    let topQuery = {
-      resource: query.resourceType + "/" + query.resourceName,
-      namespace: query.namespace
+    const topQuery = {
+      resource: `${query.resourceType}/${query.resourceName}`,
+      namespace: query.namespace,
     };
 
     return (
@@ -45,7 +48,7 @@ class TopRoutesTabs extends React.Component {
         <TopModule
           pathPrefix={pathPrefix}
           query={topQuery}
-          startTap={true}
+          startTap
           updateUnmeshedSources={updateUnmeshedSources}
           maxRowsToDisplay={10} />
         <QueryToCliCmd cmdName="top" query={topQuery} resource={topQuery.resource} />
@@ -60,12 +63,12 @@ class TopRoutesTabs extends React.Component {
       return <ConfigureProfilesMsg />;
     }
 
-    let routesQuery = {
+    const routesQuery = {
       resource_name: query.resourceName,
       resource_type: query.resourceType,
-      namespace: query.namespace
+      namespace: query.namespace,
     };
-    let resource = query.resourceType + "/" + query.resourceName;
+    const resource = `${query.resourceType}/${query.resourceName}`;
 
     return (
       <React.Fragment>
@@ -80,7 +83,7 @@ class TopRoutesTabs extends React.Component {
     const { value } = this.state;
 
     return (
-      <Paper className={classes.root}>
+      <Paper className={classes.root} elevation={3}>
         <AppBar position="static" className={classes.root}>
 
           <Tabs
@@ -100,18 +103,21 @@ class TopRoutesTabs extends React.Component {
 }
 
 TopRoutesTabs.propTypes = {
-  classes: PropTypes.shape({}).isRequired,
   disableTop: PropTypes.bool,
   pathPrefix: PropTypes.string.isRequired,
-  query: PropTypes.shape({}),
+  query: PropTypes.shape({
+    namespace: PropTypes.string,
+    resourceType: PropTypes.string,
+    resourceName: PropTypes.string,
+  }),
   theme: PropTypes.shape({}).isRequired,
-  updateUnmeshedSources: PropTypes.func
+  updateUnmeshedSources: PropTypes.func,
 };
 
 TopRoutesTabs.defaultProps = {
   disableTop: false,
   query: {},
-  updateUnmeshedSources: _noop
+  updateUnmeshedSources: _noop,
 };
 
 export default withStyles(styles, { withTheme: true })(TopRoutesTabs);

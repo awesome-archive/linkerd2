@@ -16,13 +16,18 @@ message Global {
   string linkerd_namespace = 1;
   bool cni_enabled = 2;
 
-  // Control plane and proxy-init version
+  // Control plane version
   string version = 3;
 
   // If present, configures identity.
   IdentityContext identity_context = 4;
 
   AutoInjectContext auto_inject_context = 6 [deprecated=true];
+
+  bool omitWebhookSideEffects = 7;
+
+  // Override default `cluster.local`
+  string cluster_domain = 8;
 }
 
 message Proxy {
@@ -30,8 +35,8 @@ message Proxy {
   Image proxy_init_image = 2;
 
   Port control_port = 3;
-  repeated Port ignore_inbound_ports = 4;
-  repeated Port ignore_outbound_ports = 5;
+  repeated PortRange ignore_inbound_ports = 4;
+  repeated PortRange ignore_outbound_ports = 5;
   Port inbound_port = 6;
   Port admin_port = 7;
   Port outbound_port = 8;
@@ -43,6 +48,8 @@ message Proxy {
   bool disable_external_profiles = 12;
 
   string proxy_version = 13;
+
+  string proxy_init_image_version = 14;
 }
 
 message Image {
@@ -52,6 +59,10 @@ message Image {
 
 message Port {
   uint32 port = 1;
+}
+
+message PortRange {
+  string port_range = 1;
 }
 
 message ResourceRequirements {
@@ -69,6 +80,7 @@ message IdentityContext {
 
   google.protobuf.Duration issuance_lifetime = 3;
   google.protobuf.Duration clock_skew_allowance = 4;
+  string scheme = 5;
 }
 
 message LogLevel {
@@ -79,8 +91,8 @@ message LogLevel {
 //
 // Useful for driving upgrades.
 message Install {
-  // The unique ID for this installation. Does not change on upgrade.
-  string uuid = 1;
+  reserved 1;
+  //string uuid = 1;
 
   // The CLI version that drove the last install or upgrade.
   string cli_version = 2;

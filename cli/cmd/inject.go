@@ -31,11 +31,11 @@ const (
 )
 
 type resourceTransformerInject struct {
-	injectProxy           bool
-	configs               *cfg.All
-	overrideAnnotations   map[string]string
-	proxyOutboundCapacity map[string]uint
-	enableDebugSidecar    bool
+	allowNsInject       bool
+	injectProxy         bool
+	configs             *cfg.All
+	overrideAnnotations map[string]string
+	enableDebugSidecar  bool
 }
 
 func runInjectCmd(inputs []io.Reader, errWriter, outWriter io.Writer, transformer *resourceTransformerInject) int {
@@ -56,8 +56,8 @@ sub-folders, or coming from stdin.`,
 		Example: `  # Inject all the deployments in the default namespace.
   kubectl get deploy -o yaml | linkerd inject - | kubectl apply -f -
 
-  # Download a resource and inject it through stdin.
-  curl http://url.to/yml | linkerd inject - | kubectl apply -f -
+  # Injecting a file from a remote URL
+  linkerd inject http://url.to/yml | kubectl apply -f -
 
   # Inject all the resources inside a folder and its sub-folders.
   linkerd inject <folder> | kubectl apply -f -`,
@@ -83,6 +83,7 @@ sub-folders, or coming from stdin.`,
 			options.overrideConfigs(configs, overrideAnnotations)
 
 			transformer := &resourceTransformerInject{
+				allowNsInject:       true,
 				injectProxy:         manualOption,
 				configs:             configs,
 				overrideAnnotations: overrideAnnotations,
@@ -99,10 +100,21 @@ sub-folders, or coming from stdin.`,
 		&manualOption, "manual", manualOption,
 		"Include the proxy sidecar container spec in the YAML output (the auto-injector won't pick it up, so config annotations aren't supported) (default false)",
 	)
+	flags.Uint64Var(
+		&options.waitBeforeExitSeconds, "wait-before-exit-seconds", options.waitBeforeExitSeconds,
+		"The period during which the proxy sidecar must stay alive while its pod is terminating. "+
+			"Must be smaller than terminationGracePeriodSeconds for the pod (default 0)",
+	)
 	flags.BoolVar(
 		&options.disableIdentity, "disable-identity", options.disableIdentity,
 		"Disables resources from participating in TLS identity",
 	)
+
+	flags.BoolVar(
+		&options.disableTap, "disable-tap", options.disableTap,
+		"Disables resources from being tapped",
+	)
+
 	flags.BoolVar(
 		&options.ignoreCluster, "ignore-cluster", options.ignoreCluster,
 		"Ignore the current Kubernetes cluster when checking for existing cluster configuration (default false)",
@@ -110,6 +122,13 @@ sub-folders, or coming from stdin.`,
 
 	flags.BoolVar(&enableDebugSidecar, "enable-debug-sidecar", enableDebugSidecar,
 		"Inject a debug sidecar for data plane debugging")
+
+	flags.StringVar(&options.traceCollector, "trace-collector", options.traceCollector,
+		"Collector Service address for the proxies to send Trace Data")
+
+	flags.StringVar(&options.traceCollectorSvcAccount, "trace-collector-svc-account", options.traceCollectorSvcAccount,
+		"Service account associated with the Trace collector instance")
+
 	cmd.PersistentFlags().AddFlagSet(flags)
 
 	return cmd
@@ -125,21 +144,28 @@ func uninjectAndInject(inputs []io.Reader, errWriter, outWriter io.Writer, trans
 
 func (rt resourceTransformerInject) transform(bytes []byte) ([]byte, []inject.Report, error) {
 	conf := inject.NewResourceConfig(rt.configs, inject.OriginCLI)
-	if len(rt.proxyOutboundCapacity) > 0 {
-		conf = conf.WithProxyOutboundCapacity(rt.proxyOutboundCapacity)
-	}
 
 	if rt.enableDebugSidecar {
-		conf = conf.WithDebugSidecar()
+		conf.AppendPodAnnotation(k8s.ProxyEnableDebugAnnotation, "true")
 	}
 
 	report, err := conf.ParseMetaAndYAML(bytes)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	if conf.IsControlPlaneComponent() && !rt.injectProxy {
+		return nil, nil, errors.New("--manual must be set when injecting control plane components")
+	}
+
 	reports := []inject.Report{*report}
 
-	if !report.Injectable() {
+	if rt.allowNsInject && conf.IsNamespace() {
+		b, err := conf.InjectNamespace(rt.overrideAnnotations)
+		return b, reports, err
+	}
+
+	if b, _ := report.Injectable(); !b {
 		return bytes, reports, nil
 	}
 
@@ -154,19 +180,11 @@ func (rt resourceTransformerInject) transform(bytes []byte) ([]byte, []inject.Re
 		conf.AppendPodAnnotations(rt.overrideAnnotations)
 	}
 
-	p, err := conf.GetPatch(bytes, rt.injectProxy)
+	patchJSON, err := conf.GetPatch(rt.injectProxy)
 	if err != nil {
 		return nil, nil, err
 	}
-	if p.IsEmpty() {
-		return bytes, reports, nil
-	}
-
-	patchJSON, err := p.Marshal()
-	if err != nil {
-		return nil, nil, err
-	}
-	if patchJSON == nil {
+	if len(patchJSON) == 0 {
 		return bytes, reports, nil
 	}
 	log.Infof("patch generated for: %s", report.ResName())
@@ -199,7 +217,7 @@ func (resourceTransformerInject) generateReport(reports []inject.Report, output 
 	warningsPrinted := verbose
 
 	for _, r := range reports {
-		if r.Injectable() {
+		if b, _ := r.Injectable(); b {
 			injected = append(injected, r)
 		}
 
@@ -275,7 +293,7 @@ func (resourceTransformerInject) generateReport(reports []inject.Report, output 
 	}
 
 	for _, r := range reports {
-		if r.Injectable() {
+		if b, _ := r.Injectable(); b {
 			output.Write([]byte(fmt.Sprintf("%s \"%s\" injected\n", r.Kind, r.Name)))
 		} else {
 			if r.Kind != "" {
@@ -296,7 +314,11 @@ func (options *proxyConfigOptions) fetchConfigsOrDefault() (*cfg.All, error) {
 			return nil, errors.New("--disable-identity must be set with --ignore-cluster")
 		}
 
-		install := newInstallOptionsWithDefaults()
+		install, err := newInstallOptionsWithDefaults()
+		if err != nil {
+			return nil, err
+		}
+
 		return install.configs(nil), nil
 	}
 
@@ -319,12 +341,12 @@ func (options *proxyConfigOptions) overrideConfigs(configs *cfg.All, overrideAnn
 	}
 
 	if len(options.ignoreInboundPorts) > 0 {
-		configs.Proxy.IgnoreInboundPorts = toPorts(options.ignoreInboundPorts)
-		overrideAnnotations[k8s.ProxyIgnoreInboundPortsAnnotation] = parsePorts(configs.Proxy.IgnoreInboundPorts)
+		configs.Proxy.IgnoreInboundPorts = toPortRanges(options.ignoreInboundPorts)
+		overrideAnnotations[k8s.ProxyIgnoreInboundPortsAnnotation] = parsePortRanges(configs.Proxy.IgnoreInboundPorts)
 	}
 	if len(options.ignoreOutboundPorts) > 0 {
-		configs.Proxy.IgnoreOutboundPorts = toPorts(options.ignoreOutboundPorts)
-		overrideAnnotations[k8s.ProxyIgnoreOutboundPortsAnnotation] = parsePorts(configs.Proxy.IgnoreOutboundPorts)
+		configs.Proxy.IgnoreOutboundPorts = toPortRanges(options.ignoreOutboundPorts)
+		overrideAnnotations[k8s.ProxyIgnoreOutboundPortsAnnotation] = parsePortRanges(configs.Proxy.IgnoreOutboundPorts)
 	}
 
 	if options.proxyAdminPort != 0 {
@@ -344,20 +366,27 @@ func (options *proxyConfigOptions) overrideConfigs(configs *cfg.All, overrideAnn
 		overrideAnnotations[k8s.ProxyOutboundPortAnnotation] = parsePort(configs.Proxy.OutboundPort)
 	}
 
+	if options.dockerRegistry != "" {
+		configs.Proxy.ProxyImage.ImageName = registryOverride(configs.Proxy.ProxyImage.ImageName, options.dockerRegistry)
+		configs.Proxy.ProxyInitImage.ImageName = registryOverride(configs.Proxy.ProxyInitImage.ImageName, options.dockerRegistry)
+		overrideAnnotations[k8s.ProxyImageAnnotation] = configs.Proxy.ProxyImage.ImageName
+		overrideAnnotations[k8s.ProxyInitImageAnnotation] = configs.Proxy.ProxyInitImage.ImageName
+	}
+
 	if options.proxyImage != "" {
 		configs.Proxy.ProxyImage.ImageName = options.proxyImage
-		if options.dockerRegistry != "" {
-			configs.Proxy.ProxyImage.ImageName = registryOverride(configs.Proxy.ProxyImage.ImageName, options.dockerRegistry)
-		}
 		overrideAnnotations[k8s.ProxyImageAnnotation] = configs.Proxy.ProxyImage.ImageName
 	}
 
 	if options.initImage != "" {
 		configs.Proxy.ProxyInitImage.ImageName = options.initImage
-		if options.dockerRegistry != "" {
-			configs.Proxy.ProxyInitImage.ImageName = registryOverride(configs.Proxy.ProxyInitImage.ImageName, options.dockerRegistry)
-		}
+
 		overrideAnnotations[k8s.ProxyInitImageAnnotation] = configs.Proxy.ProxyInitImage.ImageName
+	}
+
+	if options.initImageVersion != "" {
+		configs.Proxy.ProxyInitImageVersion = options.initImageVersion
+		overrideAnnotations[k8s.ProxyInitImageVersionAnnotation] = configs.Proxy.ProxyInitImageVersion
 	}
 
 	if options.imagePullPolicy != "" {
@@ -378,7 +407,11 @@ func (options *proxyConfigOptions) overrideConfigs(configs *cfg.All, overrideAnn
 
 	if options.disableIdentity {
 		configs.Global.IdentityContext = nil
-		overrideAnnotations[k8s.ProxyDisableIdentityAnnotation] = "true"
+		overrideAnnotations[k8s.ProxyDisableIdentityAnnotation] = strconv.FormatBool(true)
+	}
+
+	if options.disableTap {
+		overrideAnnotations[k8s.ProxyDisableTapAnnotation] = strconv.FormatBool(true)
 	}
 
 	// keep track of this option because its true/false value results in different
@@ -386,7 +419,7 @@ func (options *proxyConfigOptions) overrideConfigs(configs *cfg.All, overrideAnn
 	// env var. Its annotation is added only if its value is true.
 	configs.Proxy.DisableExternalProfiles = !options.enableExternalProfiles
 	if options.enableExternalProfiles {
-		overrideAnnotations[k8s.ProxyEnableExternalProfilesAnnotation] = "true"
+		overrideAnnotations[k8s.ProxyEnableExternalProfilesAnnotation] = strconv.FormatBool(true)
 	}
 
 	if options.proxyCPURequest != "" {
@@ -405,6 +438,21 @@ func (options *proxyConfigOptions) overrideConfigs(configs *cfg.All, overrideAnn
 		configs.Proxy.Resource.LimitMemory = options.proxyMemoryLimit
 		overrideAnnotations[k8s.ProxyMemoryLimitAnnotation] = options.proxyMemoryLimit
 	}
+
+	if options.traceCollector != "" {
+		overrideAnnotations[k8s.ProxyTraceCollectorSvcAddrAnnotation] = options.traceCollector
+	}
+
+	if options.traceCollectorSvcAccount != "" {
+		overrideAnnotations[k8s.ProxyTraceCollectorSvcAccountAnnotation] = options.traceCollectorSvcAccount
+	}
+	if options.waitBeforeExitSeconds != 0 {
+		overrideAnnotations[k8s.ProxyWaitBeforeExitSecondsAnnotation] = uintToString(options.waitBeforeExitSeconds)
+	}
+}
+
+func uintToString(v uint64) string {
+	return strconv.FormatUint(v, 10)
 }
 
 func toPort(p uint) *cfg.Port {
@@ -415,18 +463,18 @@ func parsePort(port *cfg.Port) string {
 	return strconv.FormatUint(uint64(port.GetPort()), 10)
 }
 
-func toPorts(ints []uint) []*cfg.Port {
-	ports := make([]*cfg.Port, len(ints))
-	for i, p := range ints {
-		ports[i] = toPort(p)
+func toPortRanges(portRanges []string) []*cfg.PortRange {
+	ports := make([]*cfg.PortRange, len(portRanges))
+	for i, p := range portRanges {
+		ports[i] = &cfg.PortRange{PortRange: p}
 	}
 	return ports
 }
 
-func parsePorts(ports []*cfg.Port) string {
+func parsePortRanges(portRanges []*cfg.PortRange) string {
 	var str string
-	for _, port := range ports {
-		str += parsePort(port) + ","
+	for _, p := range portRanges {
+		str += p.GetPortRange() + ","
 	}
 
 	return strings.TrimSuffix(str, ",")

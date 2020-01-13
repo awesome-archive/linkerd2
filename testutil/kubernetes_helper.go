@@ -54,13 +54,18 @@ func (h *KubernetesHelper) CheckIfNamespaceExists(namespace string) error {
 	return err
 }
 
-// CreateNamespaceIfNotExists creates a namespace if it does not already exist.
-func (h *KubernetesHelper) CreateNamespaceIfNotExists(namespace string, annotations map[string]string) error {
+// GetSecret retrieves a Kubernetes Secret
+func (h *KubernetesHelper) GetSecret(namespace, name string) (*corev1.Secret, error) {
+	return h.clientset.CoreV1().Secrets(namespace).Get(name, metav1.GetOptions{})
+}
+
+func (h *KubernetesHelper) createNamespaceIfNotExists(namespace string, annotations, labels map[string]string) error {
 	err := h.CheckIfNamespaceExists(namespace)
 
 	if err != nil {
 		ns := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
+				Labels:      labels,
 				Annotations: annotations,
 				Name:        namespace,
 			},
@@ -75,20 +80,29 @@ func (h *KubernetesHelper) CreateNamespaceIfNotExists(namespace string, annotati
 	return nil
 }
 
+// CreateControlPlaneNamespaceIfNotExists creates linkerd control plane namespace.
+func (h *KubernetesHelper) CreateControlPlaneNamespaceIfNotExists(namespace string) error {
+	labels := map[string]string{"linkerd.io/is-control-plane": "true", "config.linkerd.io/admission-webhooks": "disabled"}
+	annotations := map[string]string{"linkerd.io/inject": "disabled"}
+	return h.createNamespaceIfNotExists(namespace, annotations, labels)
+}
+
+// CreateDataPlaneNamespaceIfNotExists creates a dataplane namespace if it does not already exist,
+// with a linkerd.io/is-test-data-plane label for easier cleanup afterwards
+func (h *KubernetesHelper) CreateDataPlaneNamespaceIfNotExists(namespace string, annotations map[string]string) error {
+	return h.createNamespaceIfNotExists(namespace, annotations, map[string]string{"linkerd.io/is-test-data-plane": "true"})
+}
+
 // KubectlApply applies a given configuration string in a namespace. If the
 // namespace does not exist, it creates it first. If no namespace is provided,
-// it uses the default namespace.
+// it does not specify the `--namespace` flag.
 func (h *KubernetesHelper) KubectlApply(stdin string, namespace string) (string, error) {
-	if namespace == "" {
-		namespace = "default"
+	args := []string{"apply", "-f", "-"}
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
 	}
 
-	err := h.CreateNamespaceIfNotExists(namespace, nil)
-	if err != nil {
-		return "", err
-	}
-
-	return h.Kubectl(stdin, "apply", "-f", "-", "--namespace", namespace)
+	return h.Kubectl(stdin, args...)
 }
 
 // Kubectl executes an arbitrary Kubectl command
@@ -103,7 +117,7 @@ func (h *KubernetesHelper) Kubectl(stdin string, arg ...string) (string, error) 
 // getDeployments gets all deployments with a count of their ready replicas in
 // the specified namespace.
 func (h *KubernetesHelper) getDeployments(namespace string) (map[string]int, error) {
-	deploys, err := h.clientset.AppsV1beta2().Deployments(namespace).List(metav1.ListOptions{})
+	deploys, err := h.clientset.AppsV1().Deployments(namespace).List(metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +151,16 @@ func (h *KubernetesHelper) CheckDeployment(namespace string, deploymentName stri
 
 		return nil
 	})
+}
+
+// GetConfigUID returns the uid associated to the linkerd-config ConfigMap resource
+// in the given namespace
+func (h *KubernetesHelper) GetConfigUID(namespace string) (string, error) {
+	cm, err := h.clientset.CoreV1().ConfigMaps(namespace).Get(k8s.ConfigConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	return string(cm.GetUID()), nil
 }
 
 // CheckPods checks that a deployment in a namespace contains the expected
@@ -202,21 +226,25 @@ func (h *KubernetesHelper) CheckService(namespace string, serviceName string) er
 	})
 }
 
-// GetPodsForDeployment returns all pods for the given deployment
-func (h *KubernetesHelper) GetPodsForDeployment(namespace string, deploymentName string) ([]corev1.Pod, error) {
-	deploy, err := h.clientset.AppsV1beta2().Deployments(namespace).Get(deploymentName, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-
+// GetPods returns all pods with the given labels
+func (h *KubernetesHelper) GetPods(namespace string, podLabels map[string]string) ([]corev1.Pod, error) {
 	podList, err := h.clientset.CoreV1().Pods(namespace).List(metav1.ListOptions{
-		LabelSelector: labels.Set(deploy.Spec.Selector.MatchLabels).AsSelector().String(),
+		LabelSelector: labels.Set(podLabels).AsSelector().String(),
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return podList.Items, nil
+}
+
+// GetPodsForDeployment returns all pods for the given deployment
+func (h *KubernetesHelper) GetPodsForDeployment(namespace string, deploymentName string) ([]corev1.Pod, error) {
+	deploy, err := h.clientset.AppsV1().Deployments(namespace).Get(deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return h.GetPods(namespace, deploy.Spec.Selector.MatchLabels)
 }
 
 // GetPodNamesForDeployment returns all pod names for the given deployment
@@ -250,18 +278,19 @@ func (h *KubernetesHelper) ParseNamespacedResource(resource string) (string, str
 // tests can use for access to the given deployment. Note that the port-forward
 // remains running for the duration of the test.
 func (h *KubernetesHelper) URLFor(namespace, deployName string, remotePort int) (string, error) {
-	k8sAPI, err := k8s.NewAPI("", h.k8sContext, 0)
+	k8sAPI, err := k8s.NewAPI("", h.k8sContext, "", 0)
 	if err != nil {
 		return "", err
 	}
 
-	pf, err := k8s.NewPortForward(k8sAPI, namespace, deployName, 0, remotePort, false)
+	pf, err := k8s.NewPortForward(k8sAPI, namespace, deployName, "localhost", 0, remotePort, false)
 	if err != nil {
 		return "", err
 	}
 
-	go pf.Run()
-	<-pf.Ready()
+	if err = pf.Init(); err != nil {
+		return "", err
+	}
 
 	return pf.URLFor(""), nil
 }

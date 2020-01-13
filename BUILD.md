@@ -19,6 +19,8 @@ about testing from source can be found in the [TEST.md](TEST.md) guide.
 - [Dependencies](#dependencies)
   - [Updating protobuf dependencies](#updating-protobuf-dependencies)
   - [Updating Docker dependencies](#updating-docker-dependencies)
+  - [Updating ServiceProfile generated code](#updating-serviceprofile-generated-code)
+- [Helm Chart](#helm-chart)
 - [Build Architecture](#build-architecture)
 - [Generating CLI docs](#generating-cli-docs)
 
@@ -39,8 +41,6 @@ written in Go. The dashboard UI is a React application.
     clients such as `cli` and `web`, provides access to and control of the
     Linkerd2 service mesh.
   - [`tap`](controller/tap): Provides a live pipeline of requests.
-- [`proxy-init`](proxy-init): Adds a Kubernetes pod to join the Linkerd2
-  Service Mesh.
 - [`web`](web): Provides a UI dashboard to view and drive the control plane.
   This component is written in Go and React.
 
@@ -142,7 +142,37 @@ bin/linkerd -n emojivoto stat deployments
 bin/linkerd -n emojivoto tap deploy voting
 ```
 
+#### Deploying Control Plane components with Tracing
+
+Control Plane components have the `trace-collector` flag used to enable [Distributed Tracing](https://opentracing.io/docs/overview/what-is-tracing/) for development purposes. It can be enabled globally i.e Control plane components and their proxies by using the `--control-plane-tracing` installation flag.
+
+This will configure all the components to send the traces at `linkerd-collector.{{.Namespace}}.svc.{{.ClusterDomain}}:55678`
+
+```bash
+
+# install Linkerd with tracing
+linkerd install --control-plane-tracing | kubectl apply -f -
+
+# install OpenCensus collector and Jaeger collector to collect traces
+linkerd inject https://gist.githubusercontent.com/Pothulapati/245842ce7f319e8bcd02521460684d6f/raw/52c869c58b07b17caeed520aa91380c2230d6e0c/linkerd-tracing.yaml --manual | kubectl apply -f -
+```
+
+*Note:* Collector instance has to be injected, for the proxy spans to show up.
+
 ### Go
+
+#### Go modules and dependencies
+
+This repo supports [Go Modules](https://github.com/golang/go/wiki/Modules), and
+is intended to be cloned outside the `GOPATH`, where Go Modules support is
+enabled by default in Go 1.11.
+
+If you are using this repo from within the `GOPATH`, activate module support
+with:
+
+```bash
+export GO111MODULE=on
+```
 
 #### A note about Go run
 
@@ -164,6 +194,16 @@ bin/go-run cli check
 
 That is equivalent to running `linkerd check` using the code on your branch.
 
+#### Formatting
+
+All Go source code is formatted with `goimports`. The version of `goimports`
+used by this project is specified in `go.mod`. To ensure you have the same
+version installed, run
+`go install -mod=readonly golang.org/x/tools/cmd/goimports`. It's recommended
+that you set your IDE or other development tools to use `goimports`. Formatting
+is checked during CI by the `bin/fmt` script.
+
+
 #### Building the CLI for development
 
 When Linkerd2's CLI is built using `bin/docker-build` it always creates binaries
@@ -182,12 +222,6 @@ To build only the cli (locally):
 bin/build-cli-bin
 ```
 
-For repeated cli builds that do not require Go Dep changes:
-
-```bash
-LINKERD_SKIP_DEP=1 bin/build-cli-bin
-```
-
 #### Running the control plane for development
 
 Linkerd2's control plane is composed of several Go microservices. You can run
@@ -198,7 +232,7 @@ pass in valid Kubernetes credentials via the `-kubeconfig` flag. For instance,
 to run the destination service locally, run:
 
 ```bash
-bin/go-run controller/cmd/destination -kubeconfig ~/.kube/config -log-level debug
+bin/go-run controller/cmd destination -kubeconfig ~/.kube/config -log-level debug
 ```
 
 You can send test requests to the destination service using the
@@ -208,9 +242,13 @@ You can send test requests to the destination service using the
 bin/go-run controller/script/destination-client -path hello.default.svc.cluster.local:80
 ```
 
-You can also send test requests to the destination's discovery interface:
+##### Running the Tap APIService for development
+
 ```bash
-bin/go-run controller/script/discovery-client
+openssl req -nodes -x509 -newkey rsa:4096 -keyout $HOME/key.pem -out $HOME/crt.pem -subj "/C=US"
+bin/go-run controller/cmd tap --disable-common-names --tls-cert=$HOME/crt.pem --tls-key=$HOME/key.pem
+
+curl -k https://localhost:8089/apis/tap.linkerd.io/v1alpha1
 ```
 
 #### Generating CLI docs
@@ -246,14 +284,14 @@ These commands assume working [Go](https://golang.org) and
 
 #### First time setup
 
-1. Install [Yarn](https://yarnpkg.com) and use it to install dependencies:
+1. Install [Yarn](https://yarnpkg.com) and use it to install JS dependencies:
 
     ```bash
     brew install yarn
     bin/web setup
     ```
 
-1. Install Linkerd on a Kubernetes cluster.
+2. Install Linkerd on a Kubernetes cluster.
 
 #### Run web standalone
 
@@ -314,20 +352,70 @@ DOCKER_TRACE=1 bin/docker-build-proxy
 ### Updating protobuf dependencies
  If you make Protobuf changes, run:
  ```bash
-bin/dep ensure
 bin/protoc-go.sh
 ```
 
 ### Updating Docker dependencies
 
-The go Docker images rely on base dependency images with
+The Go Docker images rely on base dependency images with
 hard-coded SHA's:
 
 `gcr.io/linkerd-io/go-deps` depends on
-- [`Gopkg.lock`](Gopkg.lock)
+- [`go.mod`](go.mod)
 - [`Dockerfile-go-deps`](Dockerfile-go-deps)
 
-`bin/update-go-deps-shas` must be run when go dependencies change.
+
+When Go dependencies change, run the following:
+
+```bash
+go mod tidy
+bin/update-go-deps-shas
+```
+
+### Updating ServiceProfile generated code
+
+The [ServiceProfile client code](./controller/gen/client) is generated by
+[`bin/update-codegen.sh`](bin/update-codegen.sh), which depends on
+[K8s code-generator](https://github.com/kubernetes/code-generator), which does
+not yet support Go Modules. To re-generate this code, check out this repo into
+your `GOPATH`:
+
+```bash
+go get -u github.com/linkerd/linkerd2
+cd $GOPATH/src/github.com/linkerd/linkerd2
+bin/update-codegen.sh
+```
+
+## Helm chart
+
+The Linkerd control plane chart is located in the
+[`charts/linkerd2`](charts/linkerd2) folder. The [`charts/patch`](charts/patch)
+chart consists of the Linkerd proxy specification, which is used by the proxy
+injector to inject the proxy container. Both charts depend on the partials
+subchart which can be found in the [`charts/partials`](charts/partials) folder.
+
+During development, please use the [`bin/helm`](bin/helm) wrapper script to
+invoke the Helm commands. For example,
+
+```bash
+bin/helm install charts/linkerd2
+```
+
+This ensures that you use the same Helm version as that of the Linkerd CI
+system.
+
+For general instructions on how to install the chart check out the
+[docs](https://linkerd.io/2/tasks/install-helm/). You also need to supply or
+generate your own certificates to use the chart, as explained
+[here](https://linkerd.io/2/tasks/generate-certificates/).
+
+### Making changes to the chart templates
+
+Whenever you make changes to the files under
+[`charts/linkerd2/templates`](charts/linkerd2/templates) or its dependency
+[`charts/partials`](charts/partials), make sure to run
+[`bin/helm-build`](bin/helm-build) which will refresh the dependencies and lint
+the templates.
 
 ## Build Architecture
 
@@ -345,11 +433,7 @@ build_architecture
     "controller/Dockerfile" [color=lightblue, style=filled, shape=rect];
     "cli/Dockerfile-bin" [color=lightblue, style=filled, shape=rect];
     "grafana/Dockerfile" [color=lightblue, style=filled, shape=rect];
-    "proxy-init/Dockerfile" [color=lightblue, style=filled, shape=rect];
-    "proxy-init/integration_test/iptables/Dockerfile-tester" [color=lightblue, style=filled, shape=rect];
     "web/Dockerfile" [color=lightblue, style=filled, shape=rect];
-
-    "proxy-init/integration_test/run_tests.sh" -> "proxy-init/integration_test/iptables/Dockerfile-tester";
 
     "_docker.sh" -> "_log.sh";
     "_gcp.sh";
@@ -357,17 +441,13 @@ build_architecture
     "_tag.sh" -> "Dockerfile-go-deps";
 
     "build-cli-bin" -> "_tag.sh";
-    "build-cli-bin" -> "dep";
     "build-cli-bin" -> "root-tag";
-
-    "dep";
 
     "docker-build" -> "build-cli-bin";
     "docker-build" -> "docker-build-cli-bin";
     "docker-build" -> "docker-build-controller";
     "docker-build" -> "docker-build-grafana";
     "docker-build" -> "docker-build-proxy";
-    "docker-build" -> "docker-build-proxy-init";
     "docker-build" -> "docker-build-web";
 
     "docker-build-base" -> "_docker.sh";
@@ -396,12 +476,6 @@ build_architecture
     "docker-build-proxy" -> "_docker.sh";
     "docker-build-proxy" -> "_tag.sh";
     "docker-build-proxy" -> "Dockerfile-proxy";
-
-    "docker-build-proxy-init" -> "_docker.sh";
-    "docker-build-proxy-init" -> "_tag.sh";
-    "docker-build-proxy-init" -> "docker-build-base";
-    "docker-build-proxy-init" -> "docker-build-go-deps";
-    "docker-build-proxy-init" -> "proxy-init/Dockerfile";
 
     "docker-build-web" -> "_docker.sh";
     "docker-build-web" -> "_tag.sh";
@@ -445,23 +519,18 @@ build_architecture
 
     "test-run";
 
-    ".travis.yml" -> "_gcp.sh";
-    ".travis.yml" -> "_tag.sh";
-    ".travis.yml" -> "dep";
-    ".travis.yml" -> "docker-build";
-    ".travis.yml" -> "docker-pull";
-    ".travis.yml" -> "docker-pull-deps";
-    ".travis.yml" -> "docker-push";
-    ".travis.yml" -> "docker-push-deps";
-    ".travis.yml" -> "docker-retag-all";
-    ".travis.yml" -> "lint";
-    ".travis.yml" -> "protoc-go.sh";
+    "workflow.yml" -> "_gcp.sh";
+    "workflow.yml" -> "_tag.sh";
+    "workflow.yml" -> "docker-build";
+    "workflow.yml" -> "docker-push";
+    "workflow.yml" -> "docker-push-deps";
+    "workflow.yml" -> "docker-retag-all";
+    "workflow.yml" -> "lint";
 
     "update-go-deps-shas" -> "_tag.sh";
     "update-go-deps-shas" -> "cli/Dockerfile-bin";
     "update-go-deps-shas" -> "controller/Dockerfile";
     "update-go-deps-shas" -> "grafana/Dockerfile";
-    "update-go-deps-shas" -> "proxy-init/Dockerfile";
     "update-go-deps-shas" -> "web/Dockerfile";
 
     "web" -> "go-run";

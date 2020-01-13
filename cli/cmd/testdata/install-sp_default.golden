@@ -1,4 +1,4 @@
-apiVersion: linkerd.io/v1alpha1
+apiVersion: linkerd.io/v1alpha2
 kind: ServiceProfile
 metadata:
   name: linkerd-controller-api.linkerd.svc.cluster.local
@@ -38,10 +38,10 @@ spec:
       method: POST
       pathRegex: /api/v1/SelfCheck
 ---
-apiVersion: linkerd.io/v1alpha1
+apiVersion: linkerd.io/v1alpha2
 kind: ServiceProfile
 metadata:
-  name: linkerd-destination.linkerd.svc.cluster.local
+  name: linkerd-dst.linkerd.svc.cluster.local
   namespace: linkerd
 spec:
   routes:
@@ -54,7 +54,7 @@ spec:
       method: POST
       pathRegex: /io\.linkerd\.proxy\.destination\.Destination/GetProfile
 ---
-apiVersion: linkerd.io/v1alpha1
+apiVersion: linkerd.io/v1alpha2
 kind: ServiceProfile
 metadata:
   name: linkerd-prometheus.linkerd.svc.cluster.local
@@ -74,7 +74,7 @@ spec:
       method: GET
       pathRegex: /api/v1/series
 ---
-apiVersion: linkerd.io/v1alpha1
+apiVersion: linkerd.io/v1alpha2
 kind: ServiceProfile
 metadata:
   name: linkerd-grafana.linkerd.svc.cluster.local
@@ -121,4 +121,16 @@ spec:
     condition:
       method: GET
       pathRegex: /public/img/.*
+---
+apiVersion: linkerd.io/v1alpha2
+kind: ServiceProfile
+metadata:
+  name: linkerd-tap.linkerd.svc.cluster.local
+  namespace: linkerd
+spec:
+  routes:
+  - name: POST /linkerd2.controller.tap.Tap/TapByResource
+    condition:
+      method: POST
+      pathRegex: /linkerd2\.controller\.tap\.Tap/TapByResource
 ---

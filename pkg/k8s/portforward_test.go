@@ -78,7 +78,7 @@ spec:
 	for i, test := range tests {
 		test := test // pin
 		t.Run(fmt.Sprintf("%d: NewProxyMetricsForward returns expected result", i), func(t *testing.T) {
-			k8sClient, _, err := NewFakeClientSets(test.k8sConfigs...)
+			k8sClient, err := NewFakeAPI(test.k8sConfigs...)
 			if err != nil {
 				t.Fatalf("Unexpected error %s", err)
 			}
@@ -150,11 +150,11 @@ status:
 	for i, test := range tests {
 		test := test // pin
 		t.Run(fmt.Sprintf("%d: NewPortForward returns expected result", i), func(t *testing.T) {
-			k8sClient, _, err := NewFakeClientSets(test.k8sConfigs...)
+			k8sClient, err := NewFakeAPI(test.k8sConfigs...)
 			if err != nil {
 				t.Fatalf("Unexpected error %s", err)
 			}
-			_, err = NewPortForward(&KubernetesAPI{Interface: k8sClient}, test.ns, test.deployName, 0, 0, false)
+			_, err = NewPortForward(&KubernetesAPI{Interface: k8sClient}, test.ns, test.deployName, "localhost", 0, 0, false)
 			if err != nil || test.err != nil {
 				if (err == nil && test.err != nil) ||
 					(err != nil && test.err == nil) ||

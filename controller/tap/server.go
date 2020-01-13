@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"time"
+	"unicode/utf8"
 
 	httpPb "github.com/linkerd/linkerd2-proxy-api/go/http_types"
 	proxy "github.com/linkerd/linkerd2-proxy-api/go/tap"
@@ -20,47 +20,57 @@ import (
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/cache"
 )
 
-const podIPIndex = "ip"
+const requireIDHeader = "l5d-require-id"
+const ipIndex = "ip"
 const defaultMaxRps = 100.0
 
-type (
-	server struct {
-		tapPort             uint
-		k8sAPI              *k8s.API
-		controllerNamespace string
-	}
-)
+// GRPCTapServer describes the gRPC server implementing pb.TapServer
+type GRPCTapServer struct {
+	tapPort             uint
+	k8sAPI              *k8s.API
+	controllerNamespace string
+	trustDomain         string
+}
 
 var (
 	tapInterval = 1 * time.Second
 )
 
-func (s *server) Tap(req *public.TapRequest, stream pb.Tap_TapServer) error {
+// Tap is deprecated, use TapByResource.
+func (s *GRPCTapServer) Tap(req *public.TapRequest, stream pb.Tap_TapServer) error {
 	return status.Error(codes.Unimplemented, "Tap is deprecated, use TapByResource")
 }
 
-func (s *server) TapByResource(req *public.TapByResourceRequest, stream pb.Tap_TapByResourceServer) error {
+// TapByResource taps all resources matched by the request object.
+func (s *GRPCTapServer) TapByResource(req *public.TapByResourceRequest, stream pb.Tap_TapByResourceServer) error {
 	if req == nil {
 		return status.Error(codes.InvalidArgument, "TapByResource received nil TapByResourceRequest")
 	}
-	if req.Target == nil {
+	if req.GetTarget() == nil {
 		return status.Error(codes.InvalidArgument, "TapByResource received nil target ResourceSelection")
 	}
-	if req.MaxRps == 0.0 {
+	res := req.GetTarget().GetResource()
+	if res == nil {
+		return status.Error(codes.InvalidArgument, "TapByResource received nil target Resource")
+	}
+	if req.GetMaxRps() == 0.0 {
 		req.MaxRps = defaultMaxRps
 	}
 
-	objects, err := s.k8sAPI.GetObjects(req.Target.Resource.Namespace, req.Target.Resource.Type, req.Target.Resource.Name)
+	objects, err := s.k8sAPI.GetObjects(res.GetNamespace(), res.GetType(), res.GetName())
 	if err != nil {
 		return apiUtil.GRPCError(err)
 	}
 
 	pods := []*corev1.Pod{}
+	foundDisabledPods := false
 	for _, object := range objects {
 		podsFor, err := s.k8sAPI.GetPodsFor(object, false)
 		if err != nil {
@@ -69,34 +79,64 @@ func (s *server) TapByResource(req *public.TapByResourceRequest, stream pb.Tap_T
 
 		for _, pod := range podsFor {
 			if pkgK8s.IsMeshed(pod, s.controllerNamespace) {
-				pods = append(pods, pod)
+				if pkgK8s.IsTapDisabled(pod) {
+					foundDisabledPods = true
+				} else {
+					pods = append(pods, pod)
+				}
 			}
 		}
 	}
 
 	if len(pods) == 0 {
-		return status.Errorf(codes.NotFound, "no pods found for %s/%s",
-			req.GetTarget().GetResource().GetType(), req.GetTarget().GetResource().GetName())
+		resType := res.GetType()
+		resName := res.GetName()
+		if foundDisabledPods {
+			return status.Errorf(codes.NotFound,
+				"all pods found for %s/%s have tapping disabled", resType, resName)
+		}
+		return status.Errorf(codes.NotFound, "no pods found for %s/%s", resType, resName)
 	}
 
-	log.Infof("Tapping %d pods for target: %+v", len(pods), *req.Target.Resource)
+	log.Infof("Tapping %d pods for target: %+v", len(pods), *res)
 
 	events := make(chan *public.TapEvent)
 
 	// divide the rps evenly between all pods to tap
-	rpsPerPod := req.MaxRps / float32(len(pods))
+	rpsPerPod := req.GetMaxRps() / float32(len(pods))
 	if rpsPerPod < 1 {
 		rpsPerPod = 1
 	}
 
-	match, err := makeByResourceMatch(req.Match)
+	match, err := makeByResourceMatch(req.GetMatch())
 	if err != nil {
 		return apiUtil.GRPCError(err)
 	}
 
+	extract := &proxy.ObserveRequest_Extract{}
+
+	// HTTP is the only protocol supported for extracting metadata, so this is
+	// the only field checked.
+	extractHTTP := req.GetExtract().GetHttp()
+	if extractHTTP != nil {
+		extract = buildExtractHTTP(extractHTTP)
+	}
+
 	for _, pod := range pods {
+		// create the expected pod identity from the pod spec
+		ns := res.GetNamespace()
+		if res.GetType() == pkgK8s.Namespace {
+			ns = res.GetName()
+		}
+		name := fmt.Sprintf("%s.%s.serviceaccount.identity.%s.%s", pod.Spec.ServiceAccountName, ns, s.controllerNamespace, s.trustDomain)
+		log.Debugf("initiating tap request to %s with required name %s", pod.Spec.ServiceAccountName, name)
+
+		// pass the header metadata into the request context
+		ctx := stream.Context()
+		ctx = metadata.AppendToOutgoingContext(ctx, requireIDHeader, name)
+
 		// initiate a tap on the pod
-		go s.tapProxy(stream.Context(), rpsPerPod, match, pod.Status.PodIP, events)
+		go s.tapProxy(ctx, rpsPerPod, match, extract, pod.Status.PodIP, events)
 	}
 
 	// read events from the taps and send them back
@@ -211,6 +251,21 @@ func destinationLabels(resource *public.Resource) map[string]string {
 	return dstLabels
 }
 
+func buildExtractHTTP(extract *public.TapByResourceRequest_Extract_Http) *proxy.ObserveRequest_Extract {
+	if extract.GetHeaders() != nil {
+		return &proxy.ObserveRequest_Extract{
+			Extract: &proxy.ObserveRequest_Extract_Http_{
+				Http: &proxy.ObserveRequest_Extract_Http{
+					Extract: &proxy.ObserveRequest_Extract_Http_Headers_{
+						Headers: &proxy.ObserveRequest_Extract_Http_Headers{},
+					},
+				},
+			},
+		}
+	}
+	return nil
+}
+
 // Tap a pod.
 // This method will run continuously until an error is encountered or the
 // request is cancelled via the context.  Thus it should be called as a
@@ -219,7 +274,7 @@ func destinationLabels(resource *public.Resource) map[string]string {
 // of maxRps * 1s at most once per 1s window.  If this limit is reached in
 // less than 1s, we sleep until the end of the window before calling Observe
 // again.
-func (s *server) tapProxy(ctx context.Context, maxRps float32, match *proxy.ObserveRequest_Match, addr string, events chan *public.TapEvent) {
+func (s *GRPCTapServer) tapProxy(ctx context.Context, maxRps float32, match *proxy.ObserveRequest_Match, extract *proxy.ObserveRequest_Extract, addr string, events chan *public.TapEvent) {
 	tapAddr := fmt.Sprintf("%s:%d", addr, s.tapPort)
 	log.Infof("Establishing tap on %s", tapAddr)
 	conn, err := grpc.DialContext(ctx, tapAddr, grpc.WithInsecure())
@@ -231,8 +286,9 @@ func (s *server) tapProxy(ctx context.Context, maxRps float32, match *proxy.Obse
 	defer conn.Close()
 
 	req := &proxy.ObserveRequest{
-		Limit: uint32(maxRps * float32(tapInterval.Seconds())),
-		Match: match,
+		Limit:   uint32(maxRps * float32(tapInterval.Seconds())),
+		Match:   match,
+		Extract: extract,
 	}
 
 	for { // Request loop
@@ -270,7 +326,7 @@ func (s *server) tapProxy(ctx context.Context, maxRps float32, match *proxy.Obse
 	}
 }
 
-func (s *server) translateEvent(orig *proxy.TapEvent) *public.TapEvent {
+func (s *GRPCTapServer) translateEvent(orig *proxy.TapEvent) *public.TapEvent {
 	direction := func(orig proxy.TapEvent_ProxyDirection) public.TapEvent_ProxyDirection {
 		switch orig {
 		case proxy.TapEvent_INBOUND:
@@ -328,6 +384,25 @@ func (s *server) translateEvent(orig *proxy.TapEvent) *public.TapEvent {
 			}
 		}
 
+		headers := func(orig *httpPb.Headers) *public.Headers {
+			if orig == nil {
+				return nil
+			}
+			var headers []*public.Headers_Header
+			for _, header := range orig.GetHeaders() {
+				n := header.GetName()
+				b := header.GetValue()
+				h := public.Headers_Header{Name: n, Value: &public.Headers_Header_ValueBin{ValueBin: b}}
+				if utf8.Valid(b) {
+					h = public.Headers_Header{Name: n, Value: &public.Headers_Header_ValueStr{ValueStr: string(b)}}
+				}
+				headers = append(headers, &h)
+			}
+			return &public.Headers{
+				Headers: headers,
+			}
+		}
+
 		switch orig := orig.GetEvent().(type) {
 		case *proxy.TapEvent_Http_RequestInit_:
 			return &public.TapEvent_Http_{
@@ -339,6 +414,7 @@ func (s *server) translateEvent(orig *proxy.TapEvent) *public.TapEvent {
 							Scheme:    scheme(orig.RequestInit.GetScheme()),
 							Authority: orig.RequestInit.Authority,
 							Path:      orig.RequestInit.Path,
+							Headers:   headers(orig.RequestInit.GetHeaders()),
 						},
 					},
 				},
@@ -352,6 +428,7 @@ func (s *server) translateEvent(orig *proxy.TapEvent) *public.TapEvent {
 							Id:               id(orig.ResponseInit.GetId()),
 							SinceRequestInit: orig.ResponseInit.GetSinceRequestInit(),
 							HttpStatus:       orig.ResponseInit.GetHttpStatus(),
+							Headers:          headers(orig.ResponseInit.GetHeaders()),
 						},
 					},
 				},
@@ -386,6 +463,7 @@ func (s *server) translateEvent(orig *proxy.TapEvent) *public.TapEvent {
 							SinceResponseInit: orig.ResponseEnd.GetSinceResponseInit(),
 							ResponseBytes:     orig.ResponseEnd.GetResponseBytes(),
 							Eos:               eos(orig.ResponseEnd.GetEos()),
+							Trailers:          headers(orig.ResponseEnd.GetTrailers()),
 						},
 					},
 				},
@@ -426,36 +504,53 @@ func (s *server) translateEvent(orig *proxy.TapEvent) *public.TapEvent {
 	return ev
 }
 
-// NewServer creates a new gRPC Tap server
-func NewServer(
-	addr string,
+// NewGrpcTapServer creates a new gRPC Tap server
+func NewGrpcTapServer(
 	tapPort uint,
 	controllerNamespace string,
+	trustDomain string,
 	k8sAPI *k8s.API,
-) (*grpc.Server, net.Listener, error) {
-	k8sAPI.Pod().Informer().AddIndexers(cache.Indexers{podIPIndex: indexPodByIP})
+) *GRPCTapServer {
+	k8sAPI.Pod().Informer().AddIndexers(cache.Indexers{ipIndex: indexByIP})
+	k8sAPI.Node().Informer().AddIndexers(cache.Indexers{ipIndex: indexByIP})
 
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, nil, err
-	}
+	return newGRPCTapServer(tapPort, controllerNamespace, trustDomain, k8sAPI)
+}
 
-	s := prometheus.NewGrpcServer()
-	srv := server{
+func newGRPCTapServer(
+	tapPort uint,
+	controllerNamespace string,
+	trustDomain string,
+	k8sAPI *k8s.API,
+) *GRPCTapServer {
+	srv := &GRPCTapServer{
 		tapPort:             tapPort,
 		k8sAPI:              k8sAPI,
 		controllerNamespace: controllerNamespace,
+		trustDomain:         trustDomain,
 	}
-	pb.RegisterTapServer(s, &srv)
 
-	return s, lis, nil
+	s := prometheus.NewGrpcServer()
+	pb.RegisterTapServer(s, srv)
+
+	return srv
 }
 
-func indexPodByIP(obj interface{}) ([]string, error) {
-	if pod, ok := obj.(*corev1.Pod); ok {
-		return []string{pod.Status.PodIP}, nil
+func indexByIP(obj interface{}) ([]string, error) {
+	switch v := obj.(type) {
+	case *corev1.Pod:
+		return []string{v.Status.PodIP}, nil
+	case *corev1.Node:
+		addresses := make([]string, 0)
+		for _, address := range v.Status.Addresses {
+			if address.Type == corev1.NodeInternalIP {
+				log.Debugf("Indexing node address: %s", address.Address)
+				addresses = append(addresses, address.Address)
+			}
+		}
+		return addresses, nil
 	}
-	return []string{""}, fmt.Errorf("object is not a pod")
+	return []string{""}, fmt.Errorf("object is not a pod nor a node")
 }
 
 // hydrateEventLabels attempts to hydrate the metadata labels for an event's
@@ -464,7 +559,7 @@ func indexPodByIP(obj interface{}) ([]string, error) {
 //
 // Since errors encountered while hydrating metadata are non-fatal and result
 // only in missing labels, any errors are logged at the WARN level.
-func (s *server) hydrateEventLabels(ev *public.TapEvent) {
+func (s *GRPCTapServer) hydrateEventLabels(ev *public.TapEvent) {
 	err := s.hydrateIPLabels(ev.GetSource().GetIp(), ev.GetSourceMeta().GetLabels())
 	if err != nil {
 		log.Warnf("error hydrating source labels: %s", err)
@@ -484,64 +579,73 @@ func (s *server) hydrateEventLabels(ev *public.TapEvent) {
 
 // hydrateIPMeta attempts to determine the metadata labels for `ip` and, if
 // successful, adds them to `labels`.
-func (s *server) hydrateIPLabels(ip *public.IPAddress, labels map[string]string) error {
-	pod, err := s.podForIP(ip)
-	switch {
-	case err != nil:
+func (s *GRPCTapServer) hydrateIPLabels(ip *public.IPAddress, labels map[string]string) error {
+	res, err := s.resourceForIP(ip)
+	if err != nil {
 		return err
-	case pod == nil:
-		log.Debugf("no pod for IP %s", addr.PublicIPToString(ip))
-		return nil
-	default:
-		ownerKind, ownerName := s.k8sAPI.GetOwnerKindAndName(pod)
-		podLabels := pkgK8s.GetPodLabels(ownerKind, ownerName, pod)
+	}
+
+	switch v := res.(type) {
+	case *corev1.Pod:
+		if v == nil {
+			log.Debugf("no pod found for IP %s", addr.PublicIPToString(ip))
+			return nil
+		}
+		ownerKind, ownerName := s.k8sAPI.GetOwnerKindAndName(v, false)
+		podLabels := pkgK8s.GetPodLabels(ownerKind, ownerName, v)
 		for key, value := range podLabels {
 			labels[key] = value
 		}
-		labels[pkgK8s.Namespace] = pod.Namespace
-		return nil
+		labels[pkgK8s.Namespace] = v.Namespace
+	case *corev1.Node:
+		labels[pkgK8s.Node] = v.Name
 	}
+	return nil
 }
 
-// podForIP returns the pod corresponding to a given IP address, if one exists.
+// resourceForIP returns the node or pod corresponding to a given IP address.
 //
-// If multiple pods exist with the same IP address, this may be because some
-// are terminating and the IP has been assigned to a new pod. In this case, we
-// select the running pod, if one currently exists. If there is a single pod
-// which is not running, we return that pod. Otherwise we return `nil`, as we
-// cannot easily determine which pod sent a given request.
-//
-// If no pods were found for the provided IP address, it returns nil. Errors are
-// returned only in the event of an error indexing the pods list.
-func (s *server) podForIP(ip *public.IPAddress) (*corev1.Pod, error) {
+// First it checks if the IP corresponds to a Node's internal IP and returns the
+// node if that's the case. Otherwise it checks the running pods that match the
+// IP. If exactly one is found, it's returned. Otherwise it returns nil. Errors
+// are returned only in the event of an error searching the indices.
+func (s *GRPCTapServer) resourceForIP(ip *public.IPAddress) (runtime.Object, error) {
 	ipStr := addr.PublicIPToString(ip)
-	objs, err := s.k8sAPI.Pod().Informer().GetIndexer().ByIndex(podIPIndex, ipStr)
 
+	nodes, err := s.k8sAPI.Node().Informer().GetIndexer().ByIndex(ipIndex, ipStr)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 1 {
+		log.Debugf("found one node at IP %s", ipStr)
+		return nodes[0].(*corev1.Node), nil
+	}
+
+	pods, err := s.k8sAPI.Pod().Informer().GetIndexer().ByIndex(ipIndex, ipStr)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(objs) == 1 {
+	if len(pods) == 1 {
 		log.Debugf("found one pod at IP %s", ipStr)
-		// It's safe to cast elements of `objs` to a `Pod`s here (and in the
-		// loop below). If the object wasn't a pod, it should never have been
-		// indexed by the indexing func in the first place.
-		return objs[0].(*corev1.Pod), nil
+		return pods[0].(*corev1.Pod), nil
 	}
 
-	for _, obj := range objs {
+	var singleRunningPod *corev1.Pod
+	for _, obj := range pods {
 		pod := obj.(*corev1.Pod)
 		if pod.Status.Phase == corev1.PodRunning {
-			// Found a running pod with this IP --- it's that!
-			log.Debugf("found running pod at IP %s", ipStr)
-			return pod, nil
+			if singleRunningPod != nil {
+				log.Warnf(
+					"could not uniquely identify pod at %s (found %d pods)",
+					ipStr,
+					len(pods),
+				)
+				return nil, nil
+			}
+			singleRunningPod = pod
 		}
 	}
 
-	log.Warnf(
-		"could not uniquely identify pod at %s (found %d pods)",
-		ipStr,
-		len(objs),
-	)
-	return nil, nil
+	return singleRunningPod, nil
 }

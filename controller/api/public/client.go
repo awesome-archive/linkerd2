@@ -4,37 +4,37 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 
 	"github.com/golang/protobuf/proto"
+	destinationPb "github.com/linkerd/linkerd2-proxy-api/go/destination"
 	healthcheckPb "github.com/linkerd/linkerd2/controller/gen/common/healthcheck"
 	configPb "github.com/linkerd/linkerd2/controller/gen/config"
-	discoveryPb "github.com/linkerd/linkerd2/controller/gen/controller/discovery"
 	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/k8s"
+	"github.com/linkerd/linkerd2/pkg/protohttp"
 	log "github.com/sirupsen/logrus"
+	"go.opencensus.io/plugin/ochttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
 const (
-	apiRoot    = "/" // Must be absolute (with a leading slash).
-	apiVersion = "v1"
-	apiPrefix  = "api/" + apiVersion + "/" // Must be relative (without a leading slash).
+	apiRoot       = "/" // Must be absolute (with a leading slash).
+	apiVersion    = "v1"
+	apiPrefix     = "api/" + apiVersion + "/" // Must be relative (without a leading slash).
+	apiPort       = 8085
+	apiDeployment = "linkerd-controller"
 )
 
-// APIClient wraps two gRPC client interfaces:
-// 1) public.Api
-// 2) controller/discovery.Discovery
-// This aligns with Public API Server's `handler` struct supporting both gRPC
-// servers.
+// APIClient wraps one gRPC client interface for public.Api:
 type APIClient interface {
 	pb.ApiClient
-	discoveryPb.DiscoveryClient
+	destinationPb.DestinationClient
 }
 
 type grpcOverHTTPClient struct {
@@ -46,6 +46,12 @@ type grpcOverHTTPClient struct {
 func (c *grpcOverHTTPClient) StatSummary(ctx context.Context, req *pb.StatSummaryRequest, _ ...grpc.CallOption) (*pb.StatSummaryResponse, error) {
 	var msg pb.StatSummaryResponse
 	err := c.apiRequest(ctx, "StatSummary", req, &msg)
+	return &msg, err
+}
+
+func (c *grpcOverHTTPClient) Edges(ctx context.Context, req *pb.EdgesRequest, _ ...grpc.CallOption) (*pb.EdgesResponse, error) {
+	var msg pb.EdgesResponse
+	err := c.apiRequest(ctx, "Edges", req, &msg)
 	return &msg, err
 }
 
@@ -86,34 +92,31 @@ func (c *grpcOverHTTPClient) ListServices(ctx context.Context, req *pb.ListServi
 }
 
 func (c *grpcOverHTTPClient) Tap(ctx context.Context, req *pb.TapRequest, _ ...grpc.CallOption) (pb.Api_TapClient, error) {
-	return nil, status.Error(codes.Unimplemented, "Tap is deprecated, use TapByResource")
+	return nil, status.Error(codes.Unimplemented, "Tap is deprecated in public API, use tap APIServer")
 }
 
 func (c *grpcOverHTTPClient) TapByResource(ctx context.Context, req *pb.TapByResourceRequest, _ ...grpc.CallOption) (pb.Api_TapByResourceClient, error) {
-	url := c.endpointNameToPublicAPIURL("TapByResource")
+	return nil, status.Error(codes.Unimplemented, "Tap is deprecated in public API, use tap APIServer")
+}
+
+func (c *grpcOverHTTPClient) Get(ctx context.Context, req *destinationPb.GetDestination, _ ...grpc.CallOption) (destinationPb.Destination_GetClient, error) {
+	url := c.endpointNameToPublicAPIURL("DestinationGet")
 	httpRsp, err := c.post(ctx, url, req)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := checkIfResponseHasError(httpRsp); err != nil {
-		httpRsp.Body.Close()
+	client, err := getStreamClient(ctx, httpRsp)
+	if err != nil {
 		return nil, err
 	}
 
-	go func() {
-		<-ctx.Done()
-		log.Debug("Closing response body after context marked as done")
-		httpRsp.Body.Close()
-	}()
-
-	return &tapClient{ctx: ctx, reader: bufio.NewReader(httpRsp.Body)}, nil
+	return &destinationClient{client}, nil
 }
 
-func (c *grpcOverHTTPClient) Endpoints(ctx context.Context, req *discoveryPb.EndpointsParams, _ ...grpc.CallOption) (*discoveryPb.EndpointsResponse, error) {
-	var msg discoveryPb.EndpointsResponse
-	err := c.apiRequest(ctx, "Endpoints", req, &msg)
-	return &msg, err
+func (c *grpcOverHTTPClient) GetProfile(ctx context.Context, _ *destinationPb.GetDestination, _ ...grpc.CallOption) (destinationPb.Destination_GetProfileClient, error) {
+	// Not implemented through this client. The proxies use the gRPC server directly instead.
+	return nil, errors.New("Not implemented")
 }
 
 func (c *grpcOverHTTPClient) apiRequest(ctx context.Context, endpoint string, req proto.Message, protoResponse proto.Message) error {
@@ -127,12 +130,12 @@ func (c *grpcOverHTTPClient) apiRequest(ctx context.Context, endpoint string, re
 	defer httpRsp.Body.Close()
 	log.Debugf("gRPC-over-HTTP call returned status [%s] and content length [%d]", httpRsp.Status, httpRsp.ContentLength)
 
-	if err := checkIfResponseHasError(httpRsp); err != nil {
+	if err := protohttp.CheckIfResponseHasError(httpRsp); err != nil {
 		return err
 	}
 
 	reader := bufio.NewReader(httpRsp.Body)
-	return fromByteStreamToProtocolBuffers(reader, protoResponse)
+	return protohttp.FromByteStreamToProtocolBuffers(reader, protoResponse)
 }
 
 func (c *grpcOverHTTPClient) post(ctx context.Context, url *url.URL, req proto.Message) (*http.Response, error) {
@@ -164,37 +167,14 @@ func (c *grpcOverHTTPClient) endpointNameToPublicAPIURL(endpoint string) *url.UR
 	return c.serverURL.ResolveReference(&url.URL{Path: endpoint})
 }
 
-type tapClient struct {
-	ctx    context.Context
-	reader *bufio.Reader
+type destinationClient struct {
+	streamClient
 }
 
-func (c tapClient) Recv() (*pb.TapEvent, error) {
-	var msg pb.TapEvent
-	err := fromByteStreamToProtocolBuffers(c.reader, &msg)
+func (c destinationClient) Recv() (*destinationPb.Update, error) {
+	var msg destinationPb.Update
+	err := protohttp.FromByteStreamToProtocolBuffers(c.reader, &msg)
 	return &msg, err
-}
-
-// satisfy the pb.Api_TapClient interface
-func (c tapClient) Header() (metadata.MD, error) { return nil, nil }
-func (c tapClient) Trailer() metadata.MD         { return nil }
-func (c tapClient) CloseSend() error             { return nil }
-func (c tapClient) Context() context.Context     { return c.ctx }
-func (c tapClient) SendMsg(interface{}) error    { return nil }
-func (c tapClient) RecvMsg(interface{}) error    { return nil }
-
-func fromByteStreamToProtocolBuffers(byteStreamContainingMessage *bufio.Reader, out proto.Message) error {
-	messageAsBytes, err := deserializePayloadFromReader(byteStreamContainingMessage)
-	if err != nil {
-		return fmt.Errorf("error reading byte stream header: %v", err)
-	}
-
-	err = proto.Unmarshal(messageAsBytes, out)
-	if err != nil {
-		return fmt.Errorf("error unmarshalling array of [%d] bytes error: %v", len(messageAsBytes), err)
-	}
-
-	return nil
 }
 
 func newClient(apiURL *url.URL, httpClientToUse *http.Client, controlPlaneNamespace string) (APIClient, error) {
@@ -221,14 +201,31 @@ func NewInternalClient(controlPlaneNamespace string, kubeAPIHost string) (APICli
 		return nil, err
 	}
 
-	return newClient(apiURL, http.DefaultClient, controlPlaneNamespace)
+	return newClient(apiURL, &http.Client{Transport: &ochttp.Transport{}}, controlPlaneNamespace)
 }
 
 // NewExternalClient creates a new Public API client intended to run from
 // outside a Kubernetes cluster.
 func NewExternalClient(controlPlaneNamespace string, kubeAPI *k8s.KubernetesAPI) (APIClient, error) {
-	apiURL, err := kubeAPI.URLFor(controlPlaneNamespace, "/services/linkerd-controller-api:http/proxy/")
+	portforward, err := k8s.NewPortForward(
+		kubeAPI,
+		controlPlaneNamespace,
+		apiDeployment,
+		"localhost",
+		0,
+		apiPort,
+		false,
+	)
 	if err != nil {
+		return nil, err
+	}
+
+	apiURL, err := url.Parse(portforward.URLFor(""))
+	if err != nil {
+		return nil, err
+	}
+
+	if err = portforward.Init(); err != nil {
 		return nil, err
 	}
 

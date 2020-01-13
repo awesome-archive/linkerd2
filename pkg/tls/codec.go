@@ -48,16 +48,28 @@ func encode(buf *bytes.Buffer, blk *pem.Block) {
 
 // === DECODE ===
 
-// DecodePEMKey parses a PEM-encoded ECDSA private key from the named path.
-func DecodePEMKey(txt string) (*ecdsa.PrivateKey, error) {
+// DecodePEMKey parses a PEM-encoded private key from the named path.
+func DecodePEMKey(txt string) (GenericPrivateKey, error) {
 	block, _ := pem.Decode([]byte(txt))
 	if block == nil {
-		return nil, errors.New("Not PEM-encoded")
+		return nil, errors.New("not PEM-encoded")
 	}
-	if block.Type != "EC PRIVATE KEY" {
-		return nil, fmt.Errorf("Expected 'EC PRIVATE KEY'; found: '%s'", block.Type)
+	switch block.Type {
+	case "EC PRIVATE KEY":
+		k, err := x509.ParseECPrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		return privateKeyEC{k}, nil
+	case "RSA PRIVATE KEY":
+		k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		return privateKeyRSA{k}, nil
+	default:
+		return nil, fmt.Errorf("unsupported block type: '%s'", block.Type)
 	}
-	return x509.ParseECPrivateKey(block.Bytes)
 }
 
 // DecodePEMCertificates parses a string containing PEM-encoded certificates.
@@ -77,23 +89,26 @@ func DecodePEMCertificates(txt string) (certs []*x509.Certificate, err error) {
 	return
 }
 
-// DecodePEMCertPool parses a string containing PE-encoded certificates into a CertPool.
-func DecodePEMCertPool(txt string) (pool *x509.CertPool, err error) {
-	certs, err := DecodePEMCertificates(txt)
-	if err != nil {
-		return
-	}
-	if len(certs) == 0 {
-		err = errors.New("No certificates found")
-		return
-	}
-
-	pool = x509.NewCertPool()
+// CertificatesToPool covererts a slice of certificates into a cert pool
+func CertificatesToPool(certs []*x509.Certificate) *x509.CertPool {
+	pool := x509.NewCertPool()
 	for _, c := range certs {
 		pool.AddCert(c)
 	}
+	return pool
+}
 
-	return
+// DecodePEMCertPool parses a string containing PE-encoded certificates into a CertPool.
+func DecodePEMCertPool(txt string) (*x509.CertPool, error) {
+	certs, err := DecodePEMCertificates(txt)
+	if err != nil {
+		return nil, err
+	}
+	if len(certs) == 0 {
+		return nil, errors.New("no certificates found")
+	}
+
+	return CertificatesToPool(certs), nil
 }
 
 func decodeCertificatePEM(crtb []byte) (*x509.Certificate, []byte, error) {

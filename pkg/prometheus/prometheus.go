@@ -6,11 +6,10 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/plugin/ochttp"
 	"google.golang.org/grpc"
 )
-
-// WrapTransport provides a function for wrapping an http.RoundTripper
-type WrapTransport func(http.RoundTripper) http.RoundTripper
 
 var (
 	// RequestLatencyBucketsSeconds represents latency buckets to record (seconds)
@@ -90,11 +89,12 @@ func init() {
 	)
 }
 
-// NewGrpcServer returns a grpc server pre-configured with prometheus interceptors
+// NewGrpcServer returns a grpc server pre-configured with prometheus interceptors and oc-grpc handler
 func NewGrpcServer() *grpc.Server {
 	server := grpc.NewServer(
 		grpc.UnaryInterceptor(grpc_prometheus.UnaryServerInterceptor),
 		grpc.StreamInterceptor(grpc_prometheus.StreamServerInterceptor),
+		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
 	)
 
 	grpc_prometheus.EnableHandlingTimeHistogram()
@@ -102,15 +102,17 @@ func NewGrpcServer() *grpc.Server {
 	return server
 }
 
-// WithTelemetry instruments the HTTP server with prometheus
-func WithTelemetry(handler http.Handler) http.HandlerFunc {
-	return promhttp.InstrumentHandlerDuration(serverLatency,
-		promhttp.InstrumentHandlerResponseSize(serverResponseSize,
-			promhttp.InstrumentHandlerCounter(serverCounter, handler)))
+// WithTelemetry instruments the HTTP server with prometheus and oc-http handler
+func WithTelemetry(handler http.Handler) http.Handler {
+	return &ochttp.Handler{
+		Handler: promhttp.InstrumentHandlerDuration(serverLatency,
+			promhttp.InstrumentHandlerResponseSize(serverResponseSize,
+				promhttp.InstrumentHandlerCounter(serverCounter, handler))),
+	}
 }
 
 // ClientWithTelemetry instruments the HTTP client with prometheus
-func ClientWithTelemetry(name string, wt WrapTransport) WrapTransport {
+func ClientWithTelemetry(name string, wt func(http.RoundTripper) http.RoundTripper) func(http.RoundTripper) http.RoundTripper {
 	latency := clientLatency.MustCurryWith(prometheus.Labels{"client": name})
 	counter := clientCounter.MustCurryWith(prometheus.Labels{"client": name})
 	inFlight := clientInFlight.With(prometheus.Labels{"client": name})

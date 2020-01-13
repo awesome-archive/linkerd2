@@ -26,6 +26,7 @@ var (
 			LinkerdNamespace: "linkerd",
 			CniEnabled:       false,
 			IdentityContext:  nil,
+			ClusterDomain:    "cluster.local",
 		},
 		Proxy: &config.Proxy{
 			ProxyImage:              &config.Image{ImageName: "gcr.io/linkerd-io/proxy", PullPolicy: "IfNotPresent"},
@@ -38,7 +39,7 @@ var (
 			OutboundPort:            &config.Port{Port: 4140},
 			Resource:                &config.ResourceRequirements{RequestCpu: "", RequestMemory: "", LimitCpu: "", LimitMemory: ""},
 			ProxyUid:                2102,
-			LogLevel:                &config.LogLevel{Level: "warn,linkerd2_proxy=info"},
+			LogLevel:                &config.LogLevel{Level: "warn,linkerd=info"},
 			DisableExternalProfiles: false,
 		},
 	}
@@ -71,25 +72,21 @@ func TestGetPatch(t *testing.T) {
 			filename string
 			ns       *corev1.Namespace
 			conf     *inject.ResourceConfig
-			expected bool
 		}{
 			{
 				filename: "pod-inject-empty.yaml",
 				ns:       nsEnabled,
 				conf:     confNsEnabled(),
-				expected: true,
 			},
 			{
 				filename: "pod-inject-enabled.yaml",
 				ns:       nsEnabled,
 				conf:     confNsEnabled(),
-				expected: true,
 			},
 			{
 				filename: "pod-inject-enabled.yaml",
 				ns:       nsDisabled,
 				conf:     confNsDisabled(),
-				expected: true,
 			},
 		}
 
@@ -119,19 +116,10 @@ func TestGetPatch(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				p, err := fullConf.GetPatch(fakeReq.Object.Raw, true)
+				patchJSON, err := fullConf.GetPatch(true)
 				if err != nil {
 					t.Fatalf("Unexpected PatchForAdmissionRequest error: %s", err)
 				}
-				patchJSON, err := p.Marshal()
-				if err != nil {
-					t.Fatalf("Unexpected Marshal error: %s", err)
-				}
-				patchStr := string(patchJSON)
-				if patchStr != "[]" && !testCase.expected {
-					t.Fatalf("Did not expect injection for file '%s'", testCase.filename)
-				}
-
 				actualPatch, err := unmarshalPatch(patchJSON)
 				if err != nil {
 					t.Fatalf("Unexpected error: %s", err)
@@ -153,12 +141,12 @@ func TestGetPatch(t *testing.T) {
 
 		fakeReq := getFakeReq(deployment)
 		conf := confNsDisabled().WithKind(fakeReq.Kind.Kind)
-		p, err := conf.GetPatch(fakeReq.Object.Raw, true)
+		patchJSON, err := conf.GetPatch(true)
 		if err != nil {
 			t.Fatalf("Unexpected PatchForAdmissionRequest error: %s", err)
 		}
 
-		if !p.IsEmpty() {
+		if len(patchJSON) == 0 {
 			t.Errorf("Expected empty patch")
 		}
 	})

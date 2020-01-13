@@ -18,6 +18,7 @@ import (
 
 const (
 	defaultNamespace      = "linkerd"
+	defaultClusterDomain  = "cluster.local"
 	defaultDockerRegistry = "gcr.io/linkerd-io"
 
 	jsonOutput  = "json"
@@ -39,6 +40,7 @@ var (
 	apiAddr               string // An empty value means "use the Kubernetes configuration"
 	kubeconfigPath        string
 	kubeContext           string
+	impersonate           string
 	verbose               bool
 
 	// These regexs are not as strict as they could be, but are a quick and dirty
@@ -90,6 +92,7 @@ func init() {
 	RootCmd.PersistentFlags().StringVarP(&controlPlaneNamespace, "linkerd-namespace", "l", defaultNamespace, "Namespace in which Linkerd is installed [$LINKERD_NAMESPACE]")
 	RootCmd.PersistentFlags().StringVar(&kubeconfigPath, "kubeconfig", "", "Path to the kubeconfig file to use for CLI requests")
 	RootCmd.PersistentFlags().StringVar(&kubeContext, "context", "", "Name of the kubeconfig context to use")
+	RootCmd.PersistentFlags().StringVar(&impersonate, "as", "", "Username to impersonate for Kubernetes operations")
 	RootCmd.PersistentFlags().StringVar(&apiAddr, "api-addr", "", "Override kubeconfig and communicate directly with the control plane at host:port (mostly for testing)")
 	RootCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "Turn on debug logging")
 
@@ -97,6 +100,7 @@ func init() {
 	RootCmd.AddCommand(newCmdCompletion())
 	RootCmd.AddCommand(newCmdDashboard())
 	RootCmd.AddCommand(newCmdDoc())
+	RootCmd.AddCommand(newCmdEdges())
 	RootCmd.AddCommand(newCmdEndpoints())
 	RootCmd.AddCommand(newCmdGet())
 	RootCmd.AddCommand(newCmdInject())
@@ -174,32 +178,41 @@ func getSuccessRate(success, failure uint64) float64 {
 // install and inject commands. All fields in this struct should have
 // corresponding flags added in the addProxyConfigFlags func later in this file.
 type proxyConfigOptions struct {
-	proxyVersion           string
-	proxyImage             string
-	initImage              string
-	dockerRegistry         string
-	imagePullPolicy        string
-	ignoreInboundPorts     []uint
-	ignoreOutboundPorts    []uint
-	proxyUID               int64
-	proxyLogLevel          string
-	proxyInboundPort       uint
-	proxyOutboundPort      uint
-	proxyControlPort       uint
-	proxyAdminPort         uint
-	proxyCPURequest        string
-	proxyMemoryRequest     string
-	proxyCPULimit          string
-	proxyMemoryLimit       string
-	enableExternalProfiles bool
+	proxyVersion             string
+	proxyImage               string
+	initImage                string
+	initImageVersion         string
+	dockerRegistry           string
+	imagePullPolicy          string
+	ignoreInboundPorts       []string
+	ignoreOutboundPorts      []string
+	proxyUID                 int64
+	proxyLogLevel            string
+	proxyInboundPort         uint
+	proxyOutboundPort        uint
+	proxyControlPort         uint
+	proxyAdminPort           uint
+	proxyCPURequest          string
+	proxyMemoryRequest       string
+	proxyCPULimit            string
+	proxyMemoryLimit         string
+	enableExternalProfiles   bool
+	traceCollector           string
+	traceCollectorSvcAccount string
+	waitBeforeExitSeconds    uint64
 	// ignoreCluster is not validated by validate().
 	ignoreCluster   bool
 	disableIdentity bool
+	disableTap      bool
 }
 
 func (options *proxyConfigOptions) validate() error {
 	if options.proxyVersion != "" && !alphaNumDashDot.MatchString(options.proxyVersion) {
 		return fmt.Errorf("%s is not a valid version", options.proxyVersion)
+	}
+
+	if options.initImageVersion != "" && !alphaNumDashDot.MatchString(options.initImageVersion) {
+		return fmt.Errorf("%s is not a valid version", options.initImageVersion)
 	}
 
 	if options.dockerRegistry != "" && !alphaNumDashDotSlashColon.MatchString(options.dockerRegistry) {
@@ -253,6 +266,14 @@ func (options *proxyConfigOptions) validate() error {
 			options.proxyLogLevel)
 	}
 
+	if err := validateRangeSlice(options.ignoreInboundPorts); err != nil {
+		return err
+	}
+
+	if err := validateRangeSlice(options.ignoreOutboundPorts); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -267,12 +288,13 @@ func (options *proxyConfigOptions) flagSet(e pflag.ErrorHandling) *pflag.FlagSet
 	flags.StringVarP(&options.proxyVersion, "proxy-version", "v", options.proxyVersion, "Tag to be used for the Linkerd proxy images")
 	flags.StringVar(&options.proxyImage, "proxy-image", options.proxyImage, "Linkerd proxy container image name")
 	flags.StringVar(&options.initImage, "init-image", options.initImage, "Linkerd init container image name")
+	flags.StringVar(&options.initImageVersion, "init-image-version", options.initImageVersion, "Linkerd init container image version")
 	flags.StringVar(&options.dockerRegistry, "registry", options.dockerRegistry, "Docker registry to pull images from")
 	flags.StringVar(&options.imagePullPolicy, "image-pull-policy", options.imagePullPolicy, "Docker image pull policy")
 	flags.UintVar(&options.proxyInboundPort, "inbound-port", options.proxyInboundPort, "Proxy port to use for inbound traffic")
 	flags.UintVar(&options.proxyOutboundPort, "outbound-port", options.proxyOutboundPort, "Proxy port to use for outbound traffic")
-	flags.UintSliceVar(&options.ignoreInboundPorts, "skip-inbound-ports", options.ignoreInboundPorts, "Ports that should skip the proxy and send directly to the application")
-	flags.UintSliceVar(&options.ignoreOutboundPorts, "skip-outbound-ports", options.ignoreOutboundPorts, "Outbound ports that should skip the proxy")
+	flags.StringSliceVar(&options.ignoreInboundPorts, "skip-inbound-ports", options.ignoreInboundPorts, "Ports and/or port ranges (inclusive) that should skip the proxy and send directly to the application")
+	flags.StringSliceVar(&options.ignoreOutboundPorts, "skip-outbound-ports", options.ignoreOutboundPorts, "Outbound ports and/or port ranges (inclusive) that should skip the proxy")
 	flags.Int64Var(&options.proxyUID, "proxy-uid", options.proxyUID, "Run the proxy under this user ID")
 	flags.StringVar(&options.proxyLogLevel, "proxy-log-level", options.proxyLogLevel, "Log level for the proxy")
 	flags.UintVar(&options.proxyControlPort, "control-port", options.proxyControlPort, "Proxy port to use for control")
